@@ -2,6 +2,8 @@
 
 Bare-metal claude session manager. No database — state lives entirely on the filesystem under `~/.mozart/cli/`.
 
+Run `mozart guide` for an in-terminal cheatsheet at any time.
+
 ## Build
 
 ```bash
@@ -15,74 +17,115 @@ Or run without installing:
 cargo run -- <command>
 ```
 
+## Typical flow
+
+```bash
+cd cli
+
+# 1. Start a session — prints a UUID (your handle for everything)
+SESSION=$(cargo run -- new ~/workspace/repos/personal/mozart)
+
+# 2. Dispatch a turn — prints a run ID
+RUN=$(cargo run -- send $SESSION "what does this repo do?")
+
+# 3. Wait for the reply
+cargo run -- wait $RUN
+
+# 4. Follow-up turns automatically switch to --resume
+RUN=$(cargo run -- send $SESSION "what is the entry point?")
+cargo run -- wait $RUN
+```
+
 ## Commands
 
 ### `new [working-dir]`
-Mint a session ID and start its tmux session. Prints the UUID.
-```bash
-SESSION=$(cargo run -- new ~/projects/myrepo)
+Mint a session ID, start its tmux session, print the UUID.
 ```
-Defaults to current directory if `working-dir` is omitted.
+→ tmux new-session -d -s mozart-<id> -c /path/to/dir
+
+  attach:  tmux attach -t mozart-<id>
+  kill:    tmux kill-session -t mozart-<id>
+
+<uuid>
+```
+Defaults to current directory if omitted.
 
 ---
 
 ### `send <session-id> <message> [--bypass]`
 Dispatch one message turn. Prints the run ID.
-```bash
-RUN=$(cargo run -- send $SESSION "what does this repo do?")
+```
+→ first turn  (claude will name the conversation using --session-id)
+→ dispatching into mozart-<id>:
+  claude -p --session-id <id> --output-format json --permission-mode plan 'message'
+
+  run dir: ~/.mozart/cli/runs/<run-id>/
+  stream:  tail -f ~/.mozart/cli/runs/<run-id>/run.out
+  watch:   tmux attach -t mozart-<id>
+
+<run-uuid>
 ```
 `--bypass` sets `--permission-mode bypassPermissions` so the agent can edit files and run commands. Default is `plan` (read-only).
+
+The first turn uses `--session-id`; all subsequent turns use `--resume`. This is tracked by the presence of `~/.mozart/cli/sessions/<session-id>`.
 
 ---
 
 ### `wait <run-id>`
 Block until the run finishes, then print the agent's reply.
-```bash
-cargo run -- wait $RUN
+```
+· polling ~/.mozart/cli/runs/<run-id>/run.done ...
+· done  exit 0
+
+<reply>
 ```
 Exits non-zero if claude errored.
 
 ---
 
+### `ls`
+List active mozart tmux sessions and all known session IDs with their tmux status.
+```
+tmux sessions:
+  mozart-<id>
+    attach:  tmux attach -t mozart-<id>
+    kill:    tmux kill-session -t mozart-<id>
+
+sessions with turns  (~/.mozart/cli/sessions/):
+  <id>  [tmux alive]
+    kill:  mozart kill <id>
+```
+
+---
+
+### `kill <session-id>`
+Kill the tmux session and remove the session marker file.
+```
+→ tmux kill-session -t mozart-<id>
+→ rm ~/.mozart/cli/sessions/<id>
+· done
+```
+
+---
+
 ### `attach <session-id>`
 Hand your terminal over to the session's tmux pane (live output).
-```bash
-cargo run -- attach $SESSION
-```
 Detach with `Ctrl-b d`.
 
 ---
 
 ### `cancel <session-id>`
 Send `C-c` to interrupt whatever is running in the session.
-```bash
-cargo run -- cancel $SESSION
-```
 
 ---
 
 ### `cat <run-id>`
 Print a run's raw output file without waiting for it to finish.
-```bash
-cargo run -- cat $RUN
-```
 
-## Typical flow
+---
 
-```bash
-cd cli
-
-SESSION=$(cargo run -- new ~/projects/myrepo)
-RUN=$(cargo run -- send $SESSION "explain what this repo does in 2 sentences")
-cargo run -- wait $RUN
-
-# follow-up turn (automatically uses --resume)
-RUN=$(cargo run -- send $SESSION "what is the entry point?")
-cargo run -- wait $RUN
-
-# watch it run live in another terminal
-cargo run -- attach $SESSION
-```
+### `guide`
+Print a workflow cheatsheet in the terminal.
 
 ## Where state lives
 
