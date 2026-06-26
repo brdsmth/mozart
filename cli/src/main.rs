@@ -51,6 +51,8 @@ enum Cmd {
     Kill {
         session_id: String,
     },
+    /// Kill all active mozart tmux sessions and remove all session state
+    KillAll,
     /// Print a workflow cheatsheet
     Guide,
 }
@@ -347,6 +349,46 @@ fn cmd_kill(session_id: &str) -> anyhow::Result<()> {
     Ok(())
 }
 
+fn cmd_kill_all() -> anyhow::Result<()> {
+    let tmux_out = Command::new("tmux")
+        .args(["ls", "-F", "#{session_name}"])
+        .output();
+
+    let mozart_sessions: Vec<String> = match tmux_out {
+        Ok(out) if out.status.success() => String::from_utf8_lossy(&out.stdout)
+            .lines()
+            .filter(|l| l.starts_with("mozart-"))
+            .map(|l| l.to_string())
+            .collect(),
+        _ => vec![],
+    };
+
+    if mozart_sessions.is_empty() {
+        eprintln!("· no active mozart tmux sessions");
+    } else {
+        for name in &mozart_sessions {
+            eprintln!("→ tmux kill-session -t {name}");
+            Command::new("tmux")
+                .args(["kill-session", "-t", name])
+                .status()?;
+        }
+    }
+
+    let sessions_dir = cli_home().join("sessions");
+    if sessions_dir.exists() {
+        let markers: Vec<_> = fs::read_dir(&sessions_dir)?
+            .filter_map(|e| e.ok())
+            .collect();
+        for entry in &markers {
+            eprintln!("→ rm {}", entry.path().display());
+            fs::remove_file(entry.path())?;
+        }
+    }
+
+    eprintln!("· done");
+    Ok(())
+}
+
 fn cmd_guide() {
     println!("TYPICAL WORKFLOW");
     println!();
@@ -399,6 +441,7 @@ fn main() {
         Cmd::Cat { run_id }                       => cmd_cat(run_id),
         Cmd::Ls                                   => cmd_ls(),
         Cmd::Kill { session_id }                  => cmd_kill(session_id),
+        Cmd::KillAll                              => cmd_kill_all(),
         Cmd::Guide                                => { cmd_guide(); Ok(()) },
     };
     if let Err(e) = result {
