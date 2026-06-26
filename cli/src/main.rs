@@ -411,6 +411,7 @@ fn cmd_guide() {
     println!("  cat <run-id>         print raw output without waiting");
     println!("  ls                   list sessions and their tmux status");
     println!("  kill <id>            kill the tmux session and remove session state");
+    println!("  kill-all             kill all mozart tmux sessions and remove all state");
     println!("  guide                print this cheatsheet");
     println!();
     println!("STATE  (~/.mozart/cli/)");

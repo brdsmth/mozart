@@ -108,6 +108,16 @@ Kill the tmux session and remove the session marker file.
 
 ---
 
+### `kill-all`
+Kill every active mozart tmux session and remove all session marker files.
+```
+→ tmux kill-session -t mozart-<id>
+→ rm ~/.mozart/cli/sessions/<id>
+· done
+```
+
+---
+
 ### `attach <session-id>`
 Hand your terminal over to the session's tmux pane (live output).
 Detach with `Ctrl-b d`.
