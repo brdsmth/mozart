@@ -1,0 +1,15 @@
+[package]
+name = "mozart"
+version = "0.1.0"
+edition = "2021"
+
+[[bin]]
+name = "mozart"
+path = "src/main.rs"
+
+[dependencies]
+anyhow = "1"
+clap = { version = "4", features = ["derive"] }
+dirs = "5"
+serde_json = "1"
+uuid = { version = "1", features = ["v4"] }
