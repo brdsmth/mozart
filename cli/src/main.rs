@@ -3,7 +3,7 @@ use std::fs;
 use std::path::PathBuf;
 use std::process::Command;
 use std::thread;
-use std::time::Duration;
+use std::time::{Duration, SystemTime};
 use uuid::Uuid;
 
 #[derive(Parser)]
@@ -56,6 +56,8 @@ enum Cmd {
     },
     /// Kill all active mozart tmux sessions and remove all session state
     KillAll,
+    /// Print a high-level view of all sessions and their current state
+    Status,
     /// Print a workflow cheatsheet
     Guide,
 }
@@ -512,6 +514,112 @@ fn cmd_kill_all() -> anyhow::Result<()> {
     Ok(())
 }
 
+fn elapsed_secs(path: &PathBuf) -> Option<u64> {
+    fs::metadata(path)
+        .ok()
+        .and_then(|m| m.modified().ok())
+        .and_then(|t| SystemTime::now().duration_since(t).ok())
+        .map(|d| d.as_secs())
+}
+
+fn fmt_elapsed(secs: u64) -> String {
+    if secs >= 3600 {
+        format!("{}h{:02}m", secs / 3600, (secs % 3600) / 60)
+    } else if secs >= 60 {
+        format!("{}m{:02}s", secs / 60, secs % 60)
+    } else {
+        format!("{secs}s")
+    }
+}
+
+fn cmd_status() -> anyhow::Result<()> {
+    // Collect all session IDs known on disk.
+    let sessions_dir = cli_home().join("sessions");
+    let mut session_ids: Vec<String> = if sessions_dir.exists() {
+        fs::read_dir(&sessions_dir)?
+            .filter_map(|e| e.ok())
+            .map(|e| e.file_name().to_string_lossy().into_owned())
+            .collect()
+    } else {
+        vec![]
+    };
+    session_ids.sort();
+
+    // Also include any tmux sessions that don't have a marker yet (new, no turns).
+    let tmux_out = Command::new("tmux")
+        .args(["ls", "-F", "#{session_name}"])
+        .output();
+    let tmux_names: Vec<String> = match tmux_out {
+        Ok(out) if out.status.success() => String::from_utf8_lossy(&out.stdout)
+            .lines()
+            .filter(|l| l.starts_with("mozart-"))
+            .map(|l| l["mozart-".len()..].to_string())
+            .collect(),
+        _ => vec![],
+    };
+    for id in &tmux_names {
+        if !session_ids.contains(id) {
+            session_ids.push(id.clone());
+        }
+    }
+
+    if session_ids.is_empty() {
+        println!("no sessions");
+        return Ok(());
+    }
+
+    let mut n_busy = 0usize;
+    let mut n_idle = 0usize;
+    let mut lines: Vec<String> = Vec::new();
+
+    for id in &session_ids {
+        let short = &id[..8.min(id.len())];
+        let tmux_alive = tmux_session_exists(&tmux_name(id));
+
+        if let Some(run_id) = session_busy_run(id) {
+            n_busy += 1;
+            let run_short = &run_id[..8.min(run_id.len())];
+            // Use mtime of run.out as a proxy for when the run started writing.
+            // Fall back to the run dir itself if run.out doesn't exist yet.
+            let out_path = run_dir(&run_id).join("run.out");
+            let timer_path = if out_path.exists() { &out_path } else { &run_dir(&run_id) };
+            let elapsed = elapsed_secs(&timer_path.to_path_buf())
+                .map(fmt_elapsed)
+                .unwrap_or_else(|| "?".to_string());
+            lines.push(format!(
+                "  [busy]  {short}…  run {run_short}…  {elapsed} elapsed"
+            ));
+        } else if let Some(run_id) = session_latest_run(id) {
+            n_idle += 1;
+            let run_short = &run_id[..8.min(run_id.len())];
+            let done_path = run_dir(&run_id).join("run.done");
+            let ago = elapsed_secs(&done_path)
+                .map(|s| format!("  {}  ago", fmt_elapsed(s)))
+                .unwrap_or_default();
+            let tmux_tag = if tmux_alive { "" } else { "  [tmux gone]" };
+            lines.push(format!(
+                "  [idle]  {short}…  last run {run_short}…{ago}{tmux_tag}"
+            ));
+        } else {
+            // tmux exists but no turns yet
+            lines.push(format!("  [new]   {short}…  (no turns yet)"));
+        }
+    }
+
+    let total = session_ids.len();
+    print!("{total} session{}", if total == 1 { "" } else { "s" });
+    if n_busy > 0 || n_idle > 0 {
+        print!("  ({n_busy} busy, {n_idle} idle)");
+    }
+    println!();
+    println!();
+    for line in &lines {
+        println!("{line}");
+    }
+
+    Ok(())
+}
+
 fn cmd_guide() {
     println!("TYPICAL WORKFLOW");
     println!();
@@ -533,6 +641,7 @@ fn cmd_guide() {
     println!("  attach <id>          drop into the live tmux pane  (detach: Ctrl-b d)");
     println!("  cancel <id>          send C-c to interrupt a running turn");
     println!("  cat <run-id>         print raw output without waiting");
+    println!("  status               high-level view: busy / idle / new sessions");
     println!("  ls                   list sessions and their tmux status");
     println!("  kill <id>            kill the tmux session and remove session state");
     println!("  kill-all             kill all mozart tmux sessions and remove all state");
@@ -567,6 +676,7 @@ fn main() {
         Cmd::Ls                                   => cmd_ls(),
         Cmd::Kill { session_id }                  => cmd_kill(session_id),
         Cmd::KillAll                              => cmd_kill_all(),
+        Cmd::Status                               => cmd_status(),
         Cmd::Guide                                => { cmd_guide(); Ok(()) },
     };
     if let Err(e) = result {

@@ -107,6 +107,21 @@ Exits non-zero if claude errored.
 
 ---
 
+### `status`
+High-level view of all sessions and their current state.
+```
+3 sessions  (1 busy, 2 idle)
+
+  [busy]  abc12345…  run def67890…  2m30s elapsed
+  [idle]  789abcde…  last run ghi01234…  5m12s  ago
+  [new]   deadbeef…  (no turns yet)
+```
+States: `busy` = run in flight, `idle` = last run finished, `new` = tmux exists but no turns yet.
+Elapsed time for busy runs is measured from when the run started writing output.
+Idle runs show how long ago the last run finished. `[tmux gone]` appears if the tmux session was killed manually.
+
+---
+
 ### `ls`
 List active mozart tmux sessions and all known session IDs with their tmux status.
 ```
