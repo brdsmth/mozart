@@ -32,6 +32,9 @@ enum Cmd {
     /// Block until a run finishes, then print its output
     Wait {
         run_id: String,
+        /// Print the full raw JSON payload instead of the reply + digest
+        #[arg(long)]
+        json: bool,
     },
     /// Attach your terminal to a session's tmux pane
     Attach {
@@ -74,6 +77,25 @@ fn session_marker(session_id: &str) -> PathBuf {
 
 fn run_dir(run_id: &str) -> PathBuf {
     cli_home().join("runs").join(run_id)
+}
+
+/// The most recent run id dispatched for a session, stored as the contents of
+/// the session marker file. `None` for a session that has never had a turn, or
+/// one created before run ids were tracked (marker exists but is empty).
+fn session_latest_run(session_id: &str) -> Option<String> {
+    fs::read_to_string(session_marker(session_id))
+        .ok()
+        .map(|s| s.trim().to_string())
+        .filter(|s| !s.is_empty())
+}
+
+/// Whether the session has a dispatched run that hasn't produced its `run.done`
+/// sentinel yet. A session is a single tmux pane (one shell, one foreground
+/// process), so a run is in flight exactly when its latest run is unfinished.
+fn session_busy_run(session_id: &str) -> Option<String> {
+    let active = session_latest_run(session_id)?;
+    let dir = run_dir(&active);
+    (dir.exists() && !dir.join("run.done").exists()).then_some(active)
 }
 
 fn tmux_name(session_id: &str) -> String {
@@ -146,6 +168,19 @@ fn cmd_send(session_id: &str, message: &str, bypass: bool) -> anyhow::Result<()>
         anyhow::bail!("no tmux session for {} — did you run `mozart new`?", session_id);
     }
 
+    // A session is one tmux pane = one shell = one foreground process. A second
+    // turn dispatched before the first finishes would silently buffer in the
+    // pane and run only once the first returns to the prompt — turning `wait`
+    // into a much longer block than expected. Refuse instead, with a clear way
+    // out. `cancel` finalizes the in-flight run, so it's the escape hatch.
+    if let Some(busy) = session_busy_run(session_id) {
+        anyhow::bail!(
+            "session {session_id} is busy — run {busy} hasn't finished\n  \
+             wait:    mozart wait {busy}\n  \
+             cancel:  mozart cancel {session_id}"
+        );
+    }
+
     let is_first = !session_marker(session_id).exists();
     let session_flag = if is_first { "--session-id" } else { "--resume" };
     let permission_mode = if bypass { "bypassPermissions" } else { "plan" };
@@ -190,17 +225,18 @@ fn cmd_send(session_id: &str, message: &str, bypass: bool) -> anyhow::Result<()>
 
     tmux_send(&tmux, &wrapped)?;
 
-    if is_first {
-        fs::create_dir_all(cli_home().join("sessions"))?;
-        fs::write(session_marker(session_id), "")?;
-    }
+    // Record this run as the session's latest: its presence marks the session
+    // as having had a turn (so the next send uses --resume), and its contents
+    // let the busy guard above and `cancel` below find the in-flight run.
+    fs::create_dir_all(cli_home().join("sessions"))?;
+    fs::write(session_marker(session_id), &run_id)?;
 
     // stdout only — this is what RUN=$(...) captures
     println!("{}", run_id);
     Ok(())
 }
 
-fn cmd_wait(run_id: &str) -> anyhow::Result<()> {
+fn cmd_wait(run_id: &str, json: bool) -> anyhow::Result<()> {
     let dir = run_dir(run_id);
     if !dir.exists() {
         anyhow::bail!("run {} not found at {}", run_id, dir.display());
@@ -233,13 +269,88 @@ fn cmd_wait(run_id: &str) -> anyhow::Result<()> {
     let parsed: serde_json::Value = serde_json::from_str(&stdout)
         .map_err(|e| anyhow::anyhow!("failed to parse claude output: {e}\nraw: {stdout}"))?;
 
+    // `--json` hands back the untouched payload (still on stdout, so it stays
+    // pipeable into jq); the error signal is preserved via the exit code.
+    if json {
+        println!("{}", stdout.trim_end());
+        if parsed["is_error"].as_bool() == Some(true) {
+            std::process::exit(1);
+        }
+        return Ok(());
+    }
+
     if parsed["is_error"].as_bool() == Some(true) {
         eprintln!("claude error: {}", parsed["result"]);
         std::process::exit(1);
     }
 
+    // stdout stays just the reply, so `$(mozart wait $RUN)` captures only the
+    // agent's text; the digest goes to stderr.
     println!("{}", parsed["result"].as_str().unwrap_or(&stdout));
+    print_run_digest(&parsed);
     Ok(())
+}
+
+fn fmt_duration(ms: f64) -> String {
+    let total_secs = (ms / 1000.0).round() as u64;
+    if total_secs >= 60 {
+        format!("{}m{:02}s", total_secs / 60, total_secs % 60)
+    } else {
+        format!("{total_secs}s")
+    }
+}
+
+/// Prints a one-glance footer to stderr after a successful turn: turns,
+/// wall-clock, cost, and — most importantly — any tool calls the run tried
+/// and was denied. Denials only happen in plan mode (the default), so their
+/// presence is exactly the signal that the turn needed `--bypass`. Without
+/// this, a turn whose every write was blocked looks indistinguishable from a
+/// turn that simply chose not to write anything.
+fn print_run_digest(parsed: &serde_json::Value) {
+    let mut stats: Vec<String> = Vec::new();
+    if let Some(t) = parsed["num_turns"].as_u64() {
+        stats.push(format!("{t} turn{}", if t == 1 { "" } else { "s" }));
+    }
+    if let Some(d) = parsed["duration_ms"].as_f64() {
+        stats.push(fmt_duration(d));
+    }
+    if let Some(c) = parsed["total_cost_usd"].as_f64() {
+        stats.push(format!("${c:.2}"));
+    }
+
+    // Group denials by tool name for a compact `Write×13, Bash×2` breakdown.
+    let mut by_tool: std::collections::BTreeMap<String, usize> = std::collections::BTreeMap::new();
+    if let Some(arr) = parsed["permission_denials"].as_array() {
+        for d in arr {
+            let tool = d["tool_name"].as_str().unwrap_or("unknown").to_string();
+            *by_tool.entry(tool).or_insert(0) += 1;
+        }
+    }
+    let total_denials: usize = by_tool.values().sum();
+
+    if stats.is_empty() && total_denials == 0 {
+        return;
+    }
+
+    let rule = "─────────────────────────────────";
+    eprintln!();
+    eprintln!("{rule}");
+    if !stats.is_empty() {
+        eprintln!(" {}", stats.join(" · "));
+    }
+    if total_denials > 0 {
+        let breakdown = by_tool
+            .iter()
+            .map(|(tool, n)| format!("{tool}×{n}"))
+            .collect::<Vec<_>>()
+            .join(", ");
+        eprintln!(
+            " ⚠ {total_denials} tool call{} DENIED: {breakdown}",
+            if total_denials == 1 { "" } else { "s" }
+        );
+        eprintln!("   (session is in plan mode — re-send with --bypass to allow)");
+    }
+    eprintln!("{rule}");
 }
 
 fn cmd_attach(session_id: &str) -> anyhow::Result<()> {
@@ -259,6 +370,18 @@ fn cmd_cancel(session_id: &str) -> anyhow::Result<()> {
     Command::new("tmux")
         .args(["send-keys", "-t", &tmux, "C-c", ""])
         .status()?;
+
+    // The C-c aborts the whole `claude ...; echo $? ...; touch run.done` chain,
+    // so the done sentinel never gets written on its own. Without finalizing it
+    // here, `mozart wait` would block forever and the busy guard in `send`
+    // would consider the session permanently busy. Record a SIGINT exit code
+    // (130) and drop the sentinel so both unstick.
+    if let Some(active) = session_busy_run(session_id) {
+        let dir = run_dir(&active);
+        let _ = fs::write(dir.join("run.exit"), "130");
+        let _ = fs::write(dir.join("run.done"), "");
+        eprintln!("· finalized run {active} (cancelled)");
+    }
     Ok(())
 }
 
@@ -405,7 +528,8 @@ fn cmd_guide() {
     println!("  new [dir]            mint a session ID and start its tmux session");
     println!("  send <id> <msg>      dispatch a turn, print the run ID");
     println!("    --bypass           allow the agent to edit files and run commands");
-    println!("  wait <run-id>        block until done, print the agent reply");
+    println!("  wait <run-id>        block until done, print the agent reply + digest");
+    println!("    --json             print the full raw JSON payload instead");
     println!("  attach <id>          drop into the live tmux pane  (detach: Ctrl-b d)");
     println!("  cancel <id>          send C-c to interrupt a running turn");
     println!("  cat <run-id>         print raw output without waiting");
@@ -436,7 +560,7 @@ fn main() {
     let result = match &cli.command {
         Cmd::New { working_dir }                  => cmd_new(working_dir),
         Cmd::Send { session_id, message, bypass } => cmd_send(session_id, message, *bypass),
-        Cmd::Wait { run_id }                      => cmd_wait(run_id),
+        Cmd::Wait { run_id, json }                => cmd_wait(run_id, *json),
         Cmd::Attach { session_id }                => cmd_attach(session_id),
         Cmd::Cancel { session_id }                => cmd_cancel(session_id),
         Cmd::Cat { run_id }                       => cmd_cat(run_id),

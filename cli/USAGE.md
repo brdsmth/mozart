@@ -67,18 +67,42 @@ Dispatch one message turn. Prints the run ID.
 ```
 `--bypass` sets `--permission-mode bypassPermissions` so the agent can edit files and run commands. Default is `plan` (read-only).
 
-The first turn uses `--session-id`; all subsequent turns use `--resume`. This is tracked by the presence of `~/.mozart/cli/sessions/<session-id>`.
+The first turn uses `--session-id`; all subsequent turns use `--resume`. This is tracked by the presence of `~/.mozart/cli/sessions/<session-id>` (whose contents are the latest run ID).
+
+**One turn at a time per session.** A session is a single tmux pane (one shell), so `send` refuses to dispatch while that session's previous run is still going — otherwise the second turn would silently queue behind the first. You'll get:
+```
+error: session <id> is busy — run <run-id> hasn't finished
+  wait:    mozart wait <run-id>
+  cancel:  mozart cancel <id>
+```
+`wait` for it to finish, or `cancel` to abandon it (see below). For genuine parallelism, use separate sessions.
 
 ---
 
-### `wait <run-id>`
-Block until the run finishes, then print the agent's reply.
+### `wait <run-id> [--json]`
+Block until the run finishes, then print the agent's reply (stdout) followed by a
+one-glance digest (stderr): turns, wall-clock, cost, and any tool calls that were
+denied.
 ```
 · polling ~/.mozart/cli/runs/<run-id>/run.done ...
 · done  exit 0
 
 <reply>
+
+─────────────────────────────────
+ 8 turns · 5m07s · $1.21
+ ⚠ 13 tool calls DENIED: Write×13
+   (session is in plan mode — re-send with --bypass to allow)
+─────────────────────────────────
 ```
+The reply goes to stdout and the digest to stderr, so `$(mozart wait $RUN)` still
+captures only the agent's text. Denials only happen in plan mode, so seeing them is
+the cue that the turn needed `--bypass`. The digest's stats/denials rows are each
+omitted when absent.
+
+`--json` prints the full raw JSON payload to stdout instead (pipeable into `jq`),
+skipping the reply/digest formatting.
+
 Exits non-zero if claude errored.
 
 ---
@@ -125,7 +149,11 @@ Detach with `Ctrl-b d`.
 ---
 
 ### `cancel <session-id>`
-Send `C-c` to interrupt whatever is running in the session.
+Send `C-c` to interrupt whatever is running in the session, then finalize the
+in-flight run: the `C-c` aborts the `claude ...; touch run.done` chain before the
+sentinel is written, so `cancel` writes it (with exit code `130`) itself. Without
+this, `mozart wait` would block forever and the session would stay permanently
+"busy" to `send`.
 
 ---
 
@@ -141,7 +169,7 @@ Print a workflow cheatsheet in the terminal.
 
 | Path | What it is |
 |------|------------|
-| `~/.mozart/cli/sessions/<id>` | Marker file — presence means the session has had ≥1 turn (switches `--session-id` → `--resume`) |
+| `~/.mozart/cli/sessions/<id>` | Marker file — presence means the session has had ≥1 turn (switches `--session-id` → `--resume`); contents are the latest run ID (used by the `send` busy guard and by `cancel`) |
 | `~/.mozart/cli/runs/<run-id>/run.out` | claude stdout (JSON) |
 | `~/.mozart/cli/runs/<run-id>/run.err` | claude stderr |
 | `~/.mozart/cli/runs/<run-id>/run.exit` | exit code |
