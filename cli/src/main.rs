@@ -56,8 +56,20 @@ enum Cmd {
     },
     /// Kill all active mozart tmux sessions and remove all session state
     KillAll,
+    /// Show total API cost across all runs
+    Cost,
     /// Print a high-level view of all sessions and their current state
-    Status,
+    Status {
+        /// Show full session and run IDs instead of truncated ones
+        #[arg(long)]
+        full: bool,
+        /// Only show busy sessions
+        #[arg(long)]
+        busy: bool,
+        /// Only show idle sessions
+        #[arg(long)]
+        idle: bool,
+    },
     /// Print a workflow cheatsheet
     Guide,
 }
@@ -514,6 +526,80 @@ fn cmd_kill_all() -> anyhow::Result<()> {
     Ok(())
 }
 
+fn cmd_cost() -> anyhow::Result<()> {
+    let runs_dir = cli_home().join("runs");
+    if !runs_dir.exists() {
+        println!("no runs found");
+        return Ok(());
+    }
+
+    // (date_string, cost)
+    let mut by_day: std::collections::BTreeMap<String, f64> = std::collections::BTreeMap::new();
+    let mut total = 0f64;
+    let mut n_costed = 0usize;
+    let mut n_scanned = 0usize;
+
+    for entry in fs::read_dir(&runs_dir)?.filter_map(|e| e.ok()) {
+        let out_path = entry.path().join("run.out");
+        if !out_path.exists() {
+            continue;
+        }
+        n_scanned += 1;
+
+        let contents = match fs::read_to_string(&out_path) {
+            Ok(s) => s,
+            Err(_) => continue,
+        };
+        let parsed: serde_json::Value = match serde_json::from_str(&contents) {
+            Ok(v) => v,
+            Err(_) => continue,
+        };
+        let cost = match parsed["total_cost_usd"].as_f64() {
+            Some(c) => c,
+            None => continue,
+        };
+
+        // Use mtime of run.out as the date for this run.
+        let date = fs::metadata(&out_path)
+            .ok()
+            .and_then(|m| m.modified().ok())
+            .and_then(|t| {
+                let secs = t.duration_since(SystemTime::UNIX_EPOCH).ok()?.as_secs();
+                // UTC date from epoch seconds: simple division, no external crate needed.
+                // Days since epoch → date via the algorithm from http://howardhinnant.github.io/date_algorithms.html
+                let z = (secs / 86400) as i64 + 719468;
+                let era = z.div_euclid(146097);
+                let doe = (z - era * 146097) as u64;
+                let yoe = (doe - doe / 1460 + doe / 36524 - doe / 146096) / 365;
+                let y = yoe as i64 + era * 400;
+                let doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
+                let mp = (5 * doy + 2) / 153;
+                let d = doy - (153 * mp + 2) / 5 + 1;
+                let m = if mp < 10 { mp + 3 } else { mp - 9 };
+                let y = if m <= 2 { y + 1 } else { y };
+                Some(format!("{y:04}-{m:02}-{d:02}"))
+            })
+            .unwrap_or_else(|| "unknown".to_string());
+
+        *by_day.entry(date).or_insert(0.0) += cost;
+        total += cost;
+        n_costed += 1;
+    }
+
+    println!("runs scanned:  {n_scanned}");
+    println!("runs with cost:{n_costed:>3}");
+    println!("total cost:    ${total:.4}");
+    if !by_day.is_empty() {
+        println!();
+        println!("by day:");
+        for (day, cost) in &by_day {
+            println!("  {day}    ${cost:.4}");
+        }
+    }
+
+    Ok(())
+}
+
 fn elapsed_secs(path: &PathBuf) -> Option<u64> {
     fs::metadata(path)
         .ok()
@@ -532,7 +618,11 @@ fn fmt_elapsed(secs: u64) -> String {
     }
 }
 
-fn cmd_status() -> anyhow::Result<()> {
+fn cmd_status(full: bool, only_busy: bool, only_idle: bool) -> anyhow::Result<()> {
+    let id_len = if full { usize::MAX } else { 8 };
+    let short = |s: &str| -> String {
+        if s.len() <= id_len { s.to_string() } else { format!("{}…", &s[..id_len]) }
+    };
     // Collect all session IDs known on disk.
     let sessions_dir = cli_home().join("sessions");
     let mut session_ids: Vec<String> = if sessions_dir.exists() {
@@ -568,43 +658,65 @@ fn cmd_status() -> anyhow::Result<()> {
         return Ok(());
     }
 
+    struct Row {
+        // 0 = busy, 1 = idle, 2 = new — controls sort group
+        group: u8,
+        // busy: elapsed secs (lower = newer start, sort ascending within group)
+        // idle: secs since done (lower = more recent, sort ascending within group)
+        sort_key: u64,
+        line: String,
+    }
+
+    let mut rows: Vec<Row> = Vec::new();
     let mut n_busy = 0usize;
     let mut n_idle = 0usize;
-    let mut lines: Vec<String> = Vec::new();
 
     for id in &session_ids {
-        let short = &id[..8.min(id.len())];
+        let id_s = short(id);
         let tmux_alive = tmux_session_exists(&tmux_name(id));
 
         if let Some(run_id) = session_busy_run(id) {
             n_busy += 1;
-            let run_short = &run_id[..8.min(run_id.len())];
-            // Use mtime of run.out as a proxy for when the run started writing.
-            // Fall back to the run dir itself if run.out doesn't exist yet.
+            if only_idle { continue; }
+            let run_s = short(&run_id);
             let out_path = run_dir(&run_id).join("run.out");
-            let timer_path = if out_path.exists() { &out_path } else { &run_dir(&run_id) };
-            let elapsed = elapsed_secs(&timer_path.to_path_buf())
-                .map(fmt_elapsed)
-                .unwrap_or_else(|| "?".to_string());
-            lines.push(format!(
-                "  [busy]  {short}…  run {run_short}…  {elapsed} elapsed"
-            ));
+            let timer_path = if out_path.exists() { out_path } else { run_dir(&run_id) };
+            let secs = elapsed_secs(&timer_path).unwrap_or(0);
+            let elapsed = fmt_elapsed(secs);
+            rows.push(Row {
+                group: 0,
+                sort_key: secs,
+                line: format!("  [busy]  {id_s}  run {run_s}  {elapsed} elapsed"),
+            });
         } else if let Some(run_id) = session_latest_run(id) {
             n_idle += 1;
-            let run_short = &run_id[..8.min(run_id.len())];
+            if only_busy { continue; }
+            let run_s = short(&run_id);
             let done_path = run_dir(&run_id).join("run.done");
-            let ago = elapsed_secs(&done_path)
-                .map(|s| format!("  {}  ago", fmt_elapsed(s)))
-                .unwrap_or_default();
+            let secs = elapsed_secs(&done_path).unwrap_or(u64::MAX);
+            let ago = if secs == u64::MAX {
+                String::new()
+            } else {
+                format!("  {}  ago", fmt_elapsed(secs))
+            };
             let tmux_tag = if tmux_alive { "" } else { "  [tmux gone]" };
-            lines.push(format!(
-                "  [idle]  {short}…  last run {run_short}…{ago}{tmux_tag}"
-            ));
+            rows.push(Row {
+                group: 1,
+                sort_key: secs,
+                line: format!("  [idle]  {id_s}  last run {run_s}{ago}{tmux_tag}"),
+            });
         } else {
-            // tmux exists but no turns yet
-            lines.push(format!("  [new]   {short}…  (no turns yet)"));
+            if only_busy || only_idle { continue; }
+            rows.push(Row {
+                group: 2,
+                sort_key: 0,
+                line: format!("  [new]   {id_s}  (no turns yet)"),
+            });
         }
     }
+
+    // busy first (longest-running at top), then idle (most recent at top), then new
+    rows.sort_by_key(|r| (r.group, r.sort_key));
 
     let total = session_ids.len();
     print!("{total} session{}", if total == 1 { "" } else { "s" });
@@ -613,8 +725,8 @@ fn cmd_status() -> anyhow::Result<()> {
     }
     println!();
     println!();
-    for line in &lines {
-        println!("{line}");
+    for row in &rows {
+        println!("{}", row.line);
     }
 
     Ok(())
@@ -676,7 +788,8 @@ fn main() {
         Cmd::Ls                                   => cmd_ls(),
         Cmd::Kill { session_id }                  => cmd_kill(session_id),
         Cmd::KillAll                              => cmd_kill_all(),
-        Cmd::Status                               => cmd_status(),
+        Cmd::Cost                                 => cmd_cost(),
+        Cmd::Status { full, busy, idle }          => cmd_status(*full, *busy, *idle),
         Cmd::Guide                                => { cmd_guide(); Ok(()) },
     };
     if let Err(e) = result {
