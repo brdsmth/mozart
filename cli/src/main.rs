@@ -1,4 +1,5 @@
 use clap::{Parser, Subcommand};
+use serde::{Deserialize, Serialize};
 use std::fs;
 use std::path::PathBuf;
 use std::process::Command;
@@ -72,6 +73,25 @@ enum Cmd {
     },
     /// Print a workflow cheatsheet
     Guide,
+    /// Manage saved target repos
+    Repo {
+        #[command(subcommand)]
+        action: RepoCmd,
+    },
+}
+
+#[derive(Subcommand)]
+enum RepoCmd {
+    /// List saved repos
+    Ls,
+    /// Add a repo path (or re-activate it if already saved)
+    Set {
+        path: String,
+    },
+    /// Switch the active repo by number (see: mozart repo ls)
+    Use {
+        n: usize,
+    },
 }
 
 // ~/.mozart/cli/ is the root for all CLI-managed state.
@@ -85,8 +105,47 @@ fn cli_home() -> PathBuf {
         .join("cli")
 }
 
+#[derive(Serialize, Deserialize, Default)]
+struct Config {
+    repos: Vec<String>,
+    active: usize,
+}
+
+fn config_path() -> PathBuf {
+    cli_home().join("config.json")
+}
+
+fn load_config() -> Config {
+    let path = config_path();
+    fs::read_to_string(&path)
+        .ok()
+        .and_then(|s| serde_json::from_str(&s).ok())
+        .unwrap_or_default()
+}
+
+fn save_config(cfg: &Config) -> anyhow::Result<()> {
+    fs::create_dir_all(cli_home())?;
+    fs::write(config_path(), serde_json::to_string_pretty(cfg)?)?;
+    Ok(())
+}
+
+fn active_repo(cfg: &Config) -> Option<&str> {
+    cfg.repos.get(cfg.active).map(|s| s.as_str())
+}
+
 fn session_marker(session_id: &str) -> PathBuf {
     cli_home().join("sessions").join(session_id)
+}
+
+fn session_repo_file(session_id: &str) -> PathBuf {
+    cli_home().join("sessions").join(format!("{session_id}.repo"))
+}
+
+fn session_repo(session_id: &str) -> Option<String> {
+    fs::read_to_string(session_repo_file(session_id))
+        .ok()
+        .map(|s| s.trim().to_string())
+        .filter(|s| !s.is_empty())
 }
 
 fn run_dir(run_id: &str) -> PathBuf {
@@ -158,14 +217,24 @@ fn cmd_new(working_dir: &str) -> anyhow::Result<()> {
     let tmux = tmux_name(&session_id);
 
     let working_dir = if working_dir == "." {
-        std::env::current_dir()?.to_string_lossy().into_owned()
+        let cfg = load_config();
+        if let Some(repo) = active_repo(&cfg) {
+            eprintln!("· using active repo: {repo}");
+            repo.to_string()
+        } else {
+            std::env::current_dir()?.to_string_lossy().into_owned()
+        }
     } else {
         working_dir.to_string()
     };
 
     ensure_tmux_session(&tmux, &working_dir)?;
 
+    fs::create_dir_all(cli_home().join("sessions"))?;
+    fs::write(session_repo_file(&session_id), &working_dir)?;
+
     eprintln!();
+    eprintln!("  repo:    {working_dir}");
     eprintln!("  attach:  tmux attach -t {tmux}");
     eprintln!("  kill:    tmux kill-session -t {tmux}");
     eprintln!();
@@ -228,6 +297,9 @@ fn cmd_send(session_id: &str, message: &str, bypass: bool) -> anyhow::Result<()>
         eprintln!("→ first turn  (claude will name the conversation using --session-id)");
     } else {
         eprintln!("→ resuming session");
+    }
+    if let Some(repo) = session_repo(session_id) {
+        eprintln!("· repo:        {repo}");
     }
     eprintln!("→ dispatching into {tmux}:");
     eprintln!("  {invocation}");
@@ -482,6 +554,11 @@ fn cmd_kill(session_id: &str) -> anyhow::Result<()> {
         fs::remove_file(&marker)?;
     }
 
+    let repo_file = session_repo_file(session_id);
+    if repo_file.exists() {
+        let _ = fs::remove_file(&repo_file);
+    }
+
     eprintln!("· done");
     Ok(())
 }
@@ -732,10 +809,53 @@ fn cmd_status(full: bool, only_busy: bool, only_idle: bool) -> anyhow::Result<()
     Ok(())
 }
 
+fn cmd_repo_ls() -> anyhow::Result<()> {
+    let cfg = load_config();
+    if cfg.repos.is_empty() {
+        println!("no repos saved — use: mozart repo set <path>");
+        return Ok(());
+    }
+    for (i, repo) in cfg.repos.iter().enumerate() {
+        let marker = if i == cfg.active { "* " } else { "  " };
+        println!("{marker}{}: {repo}", i + 1);
+    }
+    Ok(())
+}
+
+fn cmd_repo_set(path: &str) -> anyhow::Result<()> {
+    let canonical = std::fs::canonicalize(path)
+        .map(|p| p.to_string_lossy().into_owned())
+        .unwrap_or_else(|_| path.to_string());
+
+    let mut cfg = load_config();
+    let idx = if let Some(pos) = cfg.repos.iter().position(|r| r == &canonical) {
+        pos
+    } else {
+        cfg.repos.push(canonical.clone());
+        cfg.repos.len() - 1
+    };
+    cfg.active = idx;
+    save_config(&cfg)?;
+    eprintln!("· active repo set to: {canonical}");
+    Ok(())
+}
+
+fn cmd_repo_use(n: usize) -> anyhow::Result<()> {
+    let mut cfg = load_config();
+    if n == 0 || n > cfg.repos.len() {
+        anyhow::bail!("no repo #{n} — run `mozart repo ls` to see options");
+    }
+    cfg.active = n - 1;
+    save_config(&cfg)?;
+    eprintln!("· active repo: {}", cfg.repos[cfg.active]);
+    Ok(())
+}
+
 fn cmd_guide() {
     println!("TYPICAL WORKFLOW");
     println!();
-    println!("  SESSION=$(mozart new ~/path/to/repo)");
+    println!("  mozart repo set ~/path/to/repo   # one-time setup");
+    println!("  SESSION=$(mozart new)             # uses active repo");
     println!("  RUN=$(mozart send $SESSION \"your message\")");
     println!("  mozart wait $RUN");
     println!();
@@ -743,9 +863,15 @@ fn cmd_guide() {
     println!("  RUN=$(mozart send $SESSION \"follow-up question\")");
     println!("  mozart wait $RUN");
     println!();
+    println!("  # toggle between repos");
+    println!("  mozart repo ls");
+    println!("  mozart repo use 2");
+    println!("  SESSION=$(mozart new)");
+    println!();
     println!("COMMANDS");
     println!();
     println!("  new [dir]            mint a session ID and start its tmux session");
+    println!("                       uses active repo from config if dir is omitted");
     println!("  send <id> <msg>      dispatch a turn, print the run ID");
     println!("    --bypass           allow the agent to edit files and run commands");
     println!("  wait <run-id>        block until done, print the agent reply + digest");
@@ -758,6 +884,9 @@ fn cmd_guide() {
     println!("  kill <id>            kill the tmux session and remove session state");
     println!("  kill-all             kill all mozart tmux sessions and remove all state");
     println!("  guide                print this cheatsheet");
+    println!("  repo ls              list saved repos (* = active)");
+    println!("  repo set <path>      add a repo and make it active");
+    println!("  repo use <n>         switch the active repo by number");
     println!();
     println!("STATE  (~/.mozart/cli/)");
     println!();
@@ -791,6 +920,11 @@ fn main() {
         Cmd::Cost                                 => cmd_cost(),
         Cmd::Status { full, busy, idle }          => cmd_status(*full, *busy, *idle),
         Cmd::Guide                                => { cmd_guide(); Ok(()) },
+        Cmd::Repo { action } => match action {
+            RepoCmd::Ls          => cmd_repo_ls(),
+            RepoCmd::Set { path} => cmd_repo_set(path),
+            RepoCmd::Use { n }   => cmd_repo_use(*n),
+        },
     };
     if let Err(e) = result {
         eprintln!("error: {e}");

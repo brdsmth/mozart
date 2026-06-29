@@ -20,20 +20,25 @@ cargo run -- <command>
 ## Typical flow
 
 ```bash
-cd cli
+# 0. One-time setup: save your target repo
+mozart repo set ~/workspace/repos/personal/mozart
 
 # 1. Start a session — prints a UUID (your handle for everything)
-SESSION=$(cargo run -- new ~/workspace/repos/personal/mozart)
+SESSION=$(mozart new)
 
 # 2. Dispatch a turn — prints a run ID
-RUN=$(cargo run -- send $SESSION "what does this repo do?")
+RUN=$(mozart send $SESSION "what does this repo do?")
 
 # 3. Wait for the reply
-cargo run -- wait $RUN
+mozart wait $RUN
 
 # 4. Follow-up turns automatically switch to --resume
-RUN=$(cargo run -- send $SESSION "what is the entry point?")
-cargo run -- wait $RUN
+RUN=$(mozart send $SESSION "what is the entry point?")
+mozart wait $RUN
+
+# Toggle to a different repo
+mozart repo use 2
+SESSION=$(mozart new)
 ```
 
 ## Commands
@@ -43,12 +48,16 @@ Mint a session ID, start its tmux session, print the UUID.
 ```
 → tmux new-session -d -s mozart-<id> -c /path/to/dir
 
+  repo:    /path/to/dir
   attach:  tmux attach -t mozart-<id>
   kill:    tmux kill-session -t mozart-<id>
 
 <uuid>
 ```
-Defaults to current directory if omitted.
+Resolution order for the working directory:
+1. Explicit `working-dir` argument if provided
+2. Active repo from `~/.mozart/cli/config.json` (set via `mozart repo set`)
+3. Current directory
 
 ---
 
@@ -56,6 +65,7 @@ Defaults to current directory if omitted.
 Dispatch one message turn. Prints the run ID.
 ```
 → first turn  (claude will name the conversation using --session-id)
+· repo:        /path/to/repo
 → dispatching into mozart-<id>:
   claude -p --session-id <id> --output-format json --permission-mode plan 'message'
 
@@ -180,11 +190,38 @@ Print a run's raw output file without waiting for it to finish.
 ### `guide`
 Print a workflow cheatsheet in the terminal.
 
+---
+
+### `repo ls`
+List all saved repos. The active one is marked with `*`.
+```
+* 1: /path/to/repo-a
+  2: /path/to/repo-b
+```
+
+---
+
+### `repo set <path>`
+Canonicalize and save a repo path, making it the active repo. If the path is already saved, it is just re-activated (no duplicates).
+```
+· active repo set to: /path/to/repo-a
+```
+
+---
+
+### `repo use <n>`
+Switch the active repo by number (1-indexed, matching `repo ls` output).
+```
+· active repo: /path/to/repo-a
+```
+
 ## Where state lives
 
 | Path | What it is |
 |------|------------|
+| `~/.mozart/cli/config.json` | Saved repos list and active index (managed by `repo set` / `repo use`) |
 | `~/.mozart/cli/sessions/<id>` | Marker file — presence means the session has had ≥1 turn (switches `--session-id` → `--resume`); contents are the latest run ID (used by the `send` busy guard and by `cancel`) |
+| `~/.mozart/cli/sessions/<id>.repo` | The working directory the session was created with (displayed by `send`) |
 | `~/.mozart/cli/runs/<run-id>/run.out` | claude stdout (JSON) |
 | `~/.mozart/cli/runs/<run-id>/run.err` | claude stderr |
 | `~/.mozart/cli/runs/<run-id>/run.exit` | exit code |
