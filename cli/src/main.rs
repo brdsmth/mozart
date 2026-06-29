@@ -564,6 +564,7 @@ fn cmd_ls() -> anyhow::Result<()> {
         let mut ids: Vec<String> = fs::read_dir(&sessions_dir)?
             .filter_map(|e| e.ok())
             .map(|e| e.file_name().to_string_lossy().into_owned())
+            .filter(|name| !name.ends_with(".repo"))
             .collect();
         ids.sort();
         if ids.is_empty() {
@@ -754,6 +755,7 @@ fn cmd_status(full: bool, only_busy: bool, only_idle: bool) -> anyhow::Result<()
         fs::read_dir(&sessions_dir)?
             .filter_map(|e| e.ok())
             .map(|e| e.file_name().to_string_lossy().into_owned())
+            .filter(|name| !name.ends_with(".repo"))
             .collect()
     } else {
         vec![]
