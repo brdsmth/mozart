@@ -8,7 +8,7 @@ use std::time::{Duration, SystemTime};
 use uuid::Uuid;
 
 #[derive(Parser)]
-#[command(name = "mozart", about = "Bare-metal claude session manager")]
+#[command(name = "mozart", about = "Bare-metal claude session manager", version)]
 struct Cli {
     #[command(subcommand)]
     command: Cmd,
