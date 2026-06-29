@@ -22,28 +22,38 @@ enum Cmd {
         #[arg(default_value = ".")]
         working_dir: String,
     },
-    /// Dispatch one message turn into a session. Prints the run ID.
+    /// Dispatch one message turn. Prints the run ID.
+    ///
+    /// Two forms:
+    ///   mozart send <session-id> <message>   — explicit session
+    ///   mozart send <message>                — uses active session (set via: mozart session use <n>)
     Send {
+        /// Session ID, or — when no message follows — the message itself (uses active session)
         session_id: String,
-        message: String,
+        /// Message to send. If omitted, session_id is treated as the message and the
+        /// active session from config is used.
+        message: Option<String>,
         /// Allow the agent to edit files and run commands
         #[arg(long)]
         bypass: bool,
     },
     /// Block until a run finishes, then print its output
     Wait {
-        run_id: String,
+        /// Run ID to wait for. If omitted, waits for the active session's latest run.
+        run_id: Option<String>,
         /// Print the full raw JSON payload instead of the reply + digest
         #[arg(long)]
         json: bool,
     },
     /// Attach your terminal to a session's tmux pane
     Attach {
-        session_id: String,
+        /// Session ID. If omitted, attaches to the active session.
+        session_id: Option<String>,
     },
     /// Send C-c to interrupt whatever is running in a session
     Cancel {
-        session_id: String,
+        /// Session ID. If omitted, cancels the active session.
+        session_id: Option<String>,
     },
     /// Print a run's raw output file without waiting
     Cat {
@@ -78,6 +88,21 @@ enum Cmd {
         #[command(subcommand)]
         action: RepoCmd,
     },
+    /// Manage the active session (use without explicit session IDs)
+    Session {
+        #[command(subcommand)]
+        action: SessionCmd,
+    },
+}
+
+#[derive(Subcommand)]
+enum SessionCmd {
+    /// List all sessions (* = active), with repo path and status
+    Ls,
+    /// Set the active session by number (see: mozart session ls)
+    Use {
+        n: usize,
+    },
 }
 
 #[derive(Subcommand)]
@@ -109,6 +134,8 @@ fn cli_home() -> PathBuf {
 struct Config {
     repos: Vec<String>,
     active: usize,
+    #[serde(default)]
+    active_session: Option<String>,
 }
 
 fn config_path() -> PathBuf {
@@ -131,6 +158,27 @@ fn save_config(cfg: &Config) -> anyhow::Result<()> {
 
 fn active_repo(cfg: &Config) -> Option<&str> {
     cfg.repos.get(cfg.active).map(|s| s.as_str())
+}
+
+fn active_session_id(cfg: &Config) -> Option<&str> {
+    cfg.active_session.as_deref()
+}
+
+fn sessions_all_ids() -> anyhow::Result<Vec<String>> {
+    let dir = cli_home().join("sessions");
+    if !dir.exists() {
+        return Ok(vec![]);
+    }
+    let mut ids: std::collections::BTreeSet<String> = Default::default();
+    for entry in fs::read_dir(&dir)?.filter_map(|e| e.ok()) {
+        let name = entry.file_name().to_string_lossy().into_owned();
+        if let Some(base) = name.strip_suffix(".repo") {
+            ids.insert(base.to_string());
+        } else {
+            ids.insert(name);
+        }
+    }
+    Ok(ids.into_iter().collect())
 }
 
 fn session_marker(session_id: &str) -> PathBuf {
@@ -851,6 +899,42 @@ fn cmd_repo_use(n: usize) -> anyhow::Result<()> {
     Ok(())
 }
 
+fn cmd_session_ls() -> anyhow::Result<()> {
+    let cfg = load_config();
+    let ids = sessions_all_ids()?;
+    if ids.is_empty() {
+        println!("no sessions — run: mozart new");
+        return Ok(());
+    }
+    for (i, id) in ids.iter().enumerate() {
+        let marker = if cfg.active_session.as_deref() == Some(id.as_str()) { "*" } else { " " };
+        let status = if session_busy_run(id).is_some() {
+            "[busy]"
+        } else if session_latest_run(id).is_some() {
+            "[idle]"
+        } else {
+            "[new] "
+        };
+        let repo = session_repo(id).unwrap_or_else(|| "(no repo)".to_string());
+        println!("{marker} {}: {}…  {}  {}", i + 1, &id[..8], status, repo);
+    }
+    Ok(())
+}
+
+fn cmd_session_use(n: usize) -> anyhow::Result<()> {
+    let ids = sessions_all_ids()?;
+    if n == 0 || n > ids.len() {
+        anyhow::bail!("no session #{n} — run `mozart session ls` to see options");
+    }
+    let session_id = ids[n - 1].clone();
+    let mut cfg = load_config();
+    cfg.active_session = Some(session_id.clone());
+    save_config(&cfg)?;
+    let repo = session_repo(&session_id).unwrap_or_else(|| "(no repo)".to_string());
+    eprintln!("· active session: {}…  {}", &session_id[..8], repo);
+    Ok(())
+}
+
 fn cmd_guide() {
     println!("TYPICAL WORKFLOW");
     println!();
@@ -868,16 +952,24 @@ fn cmd_guide() {
     println!("  mozart repo use 2");
     println!("  SESSION=$(mozart new)");
     println!();
+    println!("  # toggle between sessions (no UUID needed after session use)");
+    println!("  mozart session ls");
+    println!("  mozart session use 2");
+    println!("  mozart send \"follow-up question\"   # uses active session");
+    println!("  mozart wait                         # uses active session's latest run");
+    println!();
     println!("COMMANDS");
     println!();
     println!("  new [dir]            mint a session ID and start its tmux session");
     println!("                       uses active repo from config if dir is omitted");
-    println!("  send <id> <msg>      dispatch a turn, print the run ID");
+    println!("  send [id] <msg>      dispatch a turn, print the run ID");
+    println!("                       id optional if active session is set");
     println!("    --bypass           allow the agent to edit files and run commands");
-    println!("  wait <run-id>        block until done, print the agent reply + digest");
+    println!("  wait [run-id]        block until done, print the agent reply + digest");
+    println!("                       run-id optional if active session is set");
     println!("    --json             print the full raw JSON payload instead");
-    println!("  attach <id>          drop into the live tmux pane  (detach: Ctrl-b d)");
-    println!("  cancel <id>          send C-c to interrupt a running turn");
+    println!("  attach [id]          drop into the live tmux pane  (detach: Ctrl-b d)");
+    println!("  cancel [id]          send C-c to interrupt a running turn");
     println!("  cat <run-id>         print raw output without waiting");
     println!("  status               high-level view: busy / idle / new sessions");
     println!("  ls                   list sessions and their tmux status");
@@ -887,6 +979,8 @@ fn cmd_guide() {
     println!("  repo ls              list saved repos (* = active)");
     println!("  repo set <path>      add a repo and make it active");
     println!("  repo use <n>         switch the active repo by number");
+    println!("  session ls           list all sessions (* = active), with repo and status");
+    println!("  session use <n>      set the active session by number");
     println!();
     println!("STATE  (~/.mozart/cli/)");
     println!();
@@ -908,22 +1002,72 @@ fn cmd_guide() {
 fn main() {
     let cli = Cli::parse();
     let result = match &cli.command {
-        Cmd::New { working_dir }                  => cmd_new(working_dir),
-        Cmd::Send { session_id, message, bypass } => cmd_send(session_id, message, *bypass),
-        Cmd::Wait { run_id, json }                => cmd_wait(run_id, *json),
-        Cmd::Attach { session_id }                => cmd_attach(session_id),
-        Cmd::Cancel { session_id }                => cmd_cancel(session_id),
-        Cmd::Cat { run_id }                       => cmd_cat(run_id),
-        Cmd::Ls                                   => cmd_ls(),
-        Cmd::Kill { session_id }                  => cmd_kill(session_id),
-        Cmd::KillAll                              => cmd_kill_all(),
-        Cmd::Cost                                 => cmd_cost(),
-        Cmd::Status { full, busy, idle }          => cmd_status(*full, *busy, *idle),
-        Cmd::Guide                                => { cmd_guide(); Ok(()) },
+        Cmd::New { working_dir } => cmd_new(working_dir),
+        Cmd::Send { session_id, message, bypass } => match message {
+            Some(msg) => cmd_send(session_id, msg, *bypass),
+            None => {
+                let cfg = load_config();
+                match active_session_id(&cfg) {
+                    Some(sid) => cmd_send(sid, session_id, *bypass),
+                    None => {
+                        eprintln!("error: no active session\n  set one:  mozart session use <n>\n  list:     mozart session ls");
+                        std::process::exit(1);
+                    }
+                }
+            }
+        },
+        Cmd::Wait { run_id, json } => (|| {
+            let rid: String = match run_id {
+                Some(id) => id.clone(),
+                None => {
+                    let cfg = load_config();
+                    let sid = active_session_id(&cfg)
+                        .ok_or_else(|| anyhow::anyhow!("no active session — set one: mozart session use <n>"))?;
+                    session_latest_run(sid)
+                        .ok_or_else(|| anyhow::anyhow!("active session has no runs yet"))?
+                }
+            };
+            cmd_wait(&rid, *json)
+        })(),
+        Cmd::Attach { session_id } => (|| {
+            let sid: String = match session_id {
+                Some(id) => id.clone(),
+                None => {
+                    let cfg = load_config();
+                    active_session_id(&cfg)
+                        .ok_or_else(|| anyhow::anyhow!("no active session — set one: mozart session use <n>"))?
+                        .to_string()
+                }
+            };
+            cmd_attach(&sid)
+        })(),
+        Cmd::Cancel { session_id } => (|| {
+            let sid: String = match session_id {
+                Some(id) => id.clone(),
+                None => {
+                    let cfg = load_config();
+                    active_session_id(&cfg)
+                        .ok_or_else(|| anyhow::anyhow!("no active session — set one: mozart session use <n>"))?
+                        .to_string()
+                }
+            };
+            cmd_cancel(&sid)
+        })(),
+        Cmd::Cat { run_id }              => cmd_cat(run_id),
+        Cmd::Ls                          => cmd_ls(),
+        Cmd::Kill { session_id }         => cmd_kill(session_id),
+        Cmd::KillAll                     => cmd_kill_all(),
+        Cmd::Cost                        => cmd_cost(),
+        Cmd::Status { full, busy, idle } => cmd_status(*full, *busy, *idle),
+        Cmd::Guide                       => { cmd_guide(); Ok(()) },
         Cmd::Repo { action } => match action {
-            RepoCmd::Ls          => cmd_repo_ls(),
-            RepoCmd::Set { path} => cmd_repo_set(path),
-            RepoCmd::Use { n }   => cmd_repo_use(*n),
+            RepoCmd::Ls           => cmd_repo_ls(),
+            RepoCmd::Set { path } => cmd_repo_set(path),
+            RepoCmd::Use { n }    => cmd_repo_use(*n),
+        },
+        Cmd::Session { action } => match action {
+            SessionCmd::Ls        => cmd_session_ls(),
+            SessionCmd::Use { n } => cmd_session_use(*n),
         },
     };
     if let Err(e) = result {

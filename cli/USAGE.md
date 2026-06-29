@@ -39,6 +39,12 @@ mozart wait $RUN
 # Toggle to a different repo
 mozart repo use 2
 SESSION=$(mozart new)
+
+# Toggle between sessions (no UUID needed after session use)
+mozart session ls
+mozart session use 2
+mozart send "follow-up question"   # uses active session
+mozart wait                        # uses active session's latest run
 ```
 
 ## Commands
@@ -61,8 +67,13 @@ Resolution order for the working directory:
 
 ---
 
-### `send <session-id> <message> [--bypass]`
+### `send [session-id] <message> [--bypass]`
 Dispatch one message turn. Prints the run ID.
+
+Two forms:
+- `mozart send <session-id> <message>` — explicit session ID
+- `mozart send <message>` — uses the active session (set via `mozart session use <n>`)
+
 ```
 → first turn  (claude will name the conversation using --session-id)
 · repo:        /path/to/repo
@@ -89,10 +100,12 @@ error: session <id> is busy — run <run-id> hasn't finished
 
 ---
 
-### `wait <run-id> [--json]`
+### `wait [run-id] [--json]`
 Block until the run finishes, then print the agent's reply (stdout) followed by a
 one-glance digest (stderr): turns, wall-clock, cost, and any tool calls that were
 denied.
+
+Omit `run-id` to wait on the active session's latest run (requires `mozart session use <n>` first).
 ```
 · polling ~/.mozart/cli/runs/<run-id>/run.done ...
 · done  exit 0
@@ -167,13 +180,13 @@ Kill every active mozart tmux session and remove all session marker files.
 
 ---
 
-### `attach <session-id>`
+### `attach [session-id]`
 Hand your terminal over to the session's tmux pane (live output).
-Detach with `Ctrl-b d`.
+Detach with `Ctrl-b d`. Omit `session-id` to attach to the active session.
 
 ---
 
-### `cancel <session-id>`
+### `cancel [session-id]`
 Send `C-c` to interrupt whatever is running in the session, then finalize the
 in-flight run: the `C-c` aborts the `claude ...; touch run.done` chain before the
 sentinel is written, so `cancel` writes it (with exit code `130`) itself. Without
@@ -215,11 +228,30 @@ Switch the active repo by number (1-indexed, matching `repo ls` output).
 · active repo: /path/to/repo-a
 ```
 
+---
+
+### `session ls`
+List all sessions with their status and repo path. The active session is marked with `*`.
+```
+* 1: abc12345…  [idle]  /path/to/repo-a
+  2: def56789…  [busy]  /path/to/repo-b
+  3: deadbeef…  [new]   /path/to/repo-a
+```
+States: `[busy]` = run in flight, `[idle]` = last run finished, `[new]` = no turns yet.
+
+---
+
+### `session use <n>`
+Set the active session by number (1-indexed, matching `session ls` output). Subsequent `send`, `wait`, `cancel`, and `attach` calls use this session when no explicit ID is given.
+```
+· active session: abc12345…  /path/to/repo-a
+```
+
 ## Where state lives
 
 | Path | What it is |
 |------|------------|
-| `~/.mozart/cli/config.json` | Saved repos list and active index (managed by `repo set` / `repo use`) |
+| `~/.mozart/cli/config.json` | Saved repos list, active repo index, and active session UUID (managed by `repo`/`session` subcommands) |
 | `~/.mozart/cli/sessions/<id>` | Marker file — presence means the session has had ≥1 turn (switches `--session-id` → `--resume`); contents are the latest run ID (used by the `send` busy guard and by `cancel`) |
 | `~/.mozart/cli/sessions/<id>.repo` | The working directory the session was created with (displayed by `send`) |
 | `~/.mozart/cli/runs/<run-id>/run.out` | claude stdout (JSON) |
