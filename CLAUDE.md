@@ -12,6 +12,8 @@ The entire project is a Rust CLI at `cli/`. All state is on the filesystem under
 - **Turns:** dispatched via `tmux send-keys`. Each turn is a `claude` CLI invocation (`claude -p --session-id` for first turn, `claude -p --resume` for subsequent). First turn is detected by the presence of `~/.mozart/cli/sessions/<id>` (the marker file).
 - **Runs:** each turn produces a run directory at `~/.mozart/cli/runs/<run-id>/` with `run.out`, `run.err`, `run.exit`, and a `run.done` sentinel. `mozart wait` polls for the sentinel.
 - **Config:** `~/.mozart/cli/config.json` stores saved repos (list + active index) and the active session UUID.
+- **Plans:** `mozart plan new "<goal>"` runs claude as a direct blocking subprocess (not tmux) to decompose a goal into a JSON task list. Stored at `~/.mozart/cli/plans/<plan-id>/` with `goal.txt`, `tasks.json`, `repo.txt` (snapshotted at creation), and `sessions.json` (dispatch records). Each task carries a `depends_on` array of 1-indexed task numbers.
+- **Queues:** `mozart queue run` is a blocking event loop that reads a plan's tasks, enforces `depends_on` ordering by dispatching wave by wave, polls for completions, and advances. State lives at `~/.mozart/cli/queues/<queue-id>/` as `meta.json` and `items.json` (live status per item). Resumable after interruption.
 
 ## Why these design choices
 

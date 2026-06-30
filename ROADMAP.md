@@ -16,22 +16,38 @@ Goal: understand the underlying data model and get one task, one agent, one turn
 
 Quality-of-life features on top of the core process model.
 
-- `mozart status` — high-level view across all sessions (busy / idle / new, elapsed time)
-- `mozart cost` — total API spend across all runs
+- `mozart status` — high-level view across all sessions (busy / idle / new, elapsed time, token usage)
+- `mozart cost` — total API spend across all runs, broken down by day
 - `mozart repo set/ls/use` — save a default working directory, toggle between repos
 - `mozart session ls/use` — toggle between sessions without passing UUIDs
 - Optional args on `send`, `wait`, `attach`, `cancel` — fall back to active session when omitted
 - `run.done` busy guard on `send` — refuses to dispatch while the previous turn is still running
 - Wait digest: turns, wall-clock, cost, denied tool calls
+- Token usage (input ↑ / output ↓) per session and as an aggregate header total in `mozart status`
 
 ## Step 2.5 — Planning (done)
 
 Bridge toward concurrency: decompose a high-level goal into isolated tasks, each dispatchable to a separate agent session.
 
-- `mozart plan new "<goal>"` — one-shot claude call (direct subprocess, not tmux) decomposes the goal into a JSON task list stored at `~/.mozart/cli/plans/<plan-id>/`
+- `mozart plan new "<goal>"` — one-shot claude call (direct subprocess, not tmux) streams a JSON task list to `~/.mozart/cli/plans/<plan-id>/`; repo path snapshotted at creation time
 - `mozart plan ls/show` — inspect plans on disk
 - `mozart plan dispatch <id> <n>` — send a task to a session (creates one if omitted, sets it as active)
+- `mozart plan dispatch-all <id>` — dispatch every task concurrently, one new session each
+- `mozart plan review <id>` — post-dispatch review: exit codes, errors, cost per task
+- Task `depends_on` field — tasks carry 1-indexed dependency lists used by the queue system
+- Conventional commit instructions baked into every dispatched task message (not delegated to CLAUDE.md)
 - Teaches the contrast between one-shot blocking subprocess (planner) and persistent tmux sessions (agent workers)
+
+## Step 2.6 — Queue System (done)
+
+Dependency-aware execution layer on top of planning: enforces `depends_on` ordering by dispatching tasks wave by wave and polling for completions.
+
+- `mozart queue new <plan-id>` — create a queue from a plan's tasks, print the queue ID
+- `mozart queue ls` — list queues with goal and progress summary
+- `mozart queue show <queue-id>` — show items with live status (pending / running / done / failed)
+- `mozart queue run <queue-id>` — blocking event loop: poll completions → unblock ready tasks → dispatch → repeat every 10s
+- Resumable: re-running after Ctrl-C skips already-done items and continues from where it left off
+- Teaches the fundamental orchestration pattern: react to completions, trigger new work
 
 ## Step 3 — Concurrency
 
