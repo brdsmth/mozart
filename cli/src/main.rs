@@ -1244,6 +1244,14 @@ fn build_task_message(task: &Task, task_num: usize, all_tasks: &[Task]) -> Strin
             }
         }
     }
+    msg.push_str(
+        "\n\nWhen complete:\n\
+         - Commit your changes using conventional commits.\n\
+         - Format: <type>(<optional scope>): <description>\n\
+         - Types: feat, fix, chore, refactor, docs, test, style\n\
+         - Example: feat(auth): add token refresh on 401 response\n\
+         - One commit per logical change; do not bundle unrelated changes."
+    );
     msg
 }
 
