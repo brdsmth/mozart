@@ -93,6 +93,11 @@ enum Cmd {
         #[command(subcommand)]
         action: SessionCmd,
     },
+    /// Decompose a goal into isolated tasks and manage task plans
+    Plan {
+        #[command(subcommand)]
+        action: PlanCmd,
+    },
 }
 
 #[derive(Subcommand)]
@@ -119,6 +124,31 @@ enum RepoCmd {
     },
 }
 
+#[derive(Subcommand)]
+enum PlanCmd {
+    /// Call claude to decompose a goal into tasks and write to disk
+    New {
+        /// The high-level goal to decompose into tasks
+        goal: String,
+    },
+    /// List all plans
+    Ls,
+    /// Show numbered task list for a plan
+    Show {
+        /// Plan ID (from `mozart plan ls`)
+        plan_id: String,
+    },
+    /// Dispatch one task to a session (creates a new session if none given)
+    Dispatch {
+        /// Plan ID
+        plan_id: String,
+        /// Task number (1-indexed, matching `mozart plan show` output)
+        task_num: usize,
+        /// Session ID to dispatch to. If omitted, a new session is created.
+        session_id: Option<String>,
+    },
+}
+
 // ~/.mozart/cli/ is the root for all CLI-managed state.
 // Sessions live at ~/.mozart/cli/sessions/<session-id> (presence = has had a turn)
 // Runs live at    ~/.mozart/cli/runs/<run-id>/{run.out, run.err, run.exit, run.done}
@@ -138,8 +168,23 @@ struct Config {
     active_session: Option<String>,
 }
 
+#[derive(Serialize, Deserialize, Debug, Clone)]
+struct Task {
+    title: String,
+    description: String,
+    context: String,
+}
+
 fn config_path() -> PathBuf {
     cli_home().join("config.json")
+}
+
+fn plans_dir() -> PathBuf {
+    cli_home().join("plans")
+}
+
+fn plan_dir(plan_id: &str) -> PathBuf {
+    plans_dir().join(plan_id)
 }
 
 fn load_config() -> Config {
@@ -260,7 +305,7 @@ fn tmux_send(name: &str, command: &str) -> anyhow::Result<()> {
     Ok(())
 }
 
-fn cmd_new(working_dir: &str) -> anyhow::Result<()> {
+fn create_session(working_dir: &str) -> anyhow::Result<String> {
     let session_id = Uuid::new_v4().to_string();
     let tmux = tmux_name(&session_id);
 
@@ -287,6 +332,11 @@ fn cmd_new(working_dir: &str) -> anyhow::Result<()> {
     eprintln!("  kill:    tmux kill-session -t {tmux}");
     eprintln!();
 
+    Ok(session_id)
+}
+
+fn cmd_new(working_dir: &str) -> anyhow::Result<()> {
+    let session_id = create_session(working_dir)?;
     // stdout only — this is what SESSION=$(...) captures
     println!("{}", session_id);
     Ok(())
@@ -937,6 +987,171 @@ fn cmd_session_use(n: usize) -> anyhow::Result<()> {
     Ok(())
 }
 
+fn cmd_plan_new(goal: &str) -> anyhow::Result<()> {
+    let plan_id = Uuid::new_v4().to_string();
+    fs::create_dir_all(plan_dir(&plan_id))?;
+    fs::write(plan_dir(&plan_id).join("goal.txt"), goal)?;
+
+    let prompt = format!(
+        "Decompose the following goal into small, isolated coding tasks.\n\
+         Each task must be independently executable by a single coding agent in its own \
+         session with no dependency on any other task completing first.\n\n\
+         Goal: {goal}\n\n\
+         Rules:\n\
+         1. Each task is scoped to a single concern and can be done in isolation.\n\
+         2. Tasks must be concrete and actionable — specific enough for a coding agent \
+            to start immediately without asking clarifying questions.\n\
+         3. Your ENTIRE response must be a JSON array. No markdown, no code fences, \
+            no preamble, no trailing text of any kind.\n\
+         4. Each element has exactly three string fields:\n\
+            - \"title\": short task name (5-10 words)\n\
+            - \"description\": what to do and how to verify it worked (2-4 sentences)\n\
+            - \"context\": background, constraints, or conventions the agent needs\n\n\
+         Output only the raw JSON array, starting with [ and ending with ].",
+        goal = goal
+    );
+
+    eprintln!("· calling claude to decompose goal...");
+    let output = Command::new("claude")
+        .args(["-p", "--output-format", "json", "--permission-mode", "plan", &prompt])
+        .output()
+        .map_err(|e| anyhow::anyhow!("failed to run claude: {e}"))?;
+
+    if !output.status.success() {
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        anyhow::bail!("claude exited non-zero:\n{stderr}");
+    }
+
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let envelope: serde_json::Value = serde_json::from_str(&stdout)
+        .map_err(|e| anyhow::anyhow!("unexpected output from claude: {e}\nraw: {stdout}"))?;
+
+    if envelope["is_error"].as_bool() == Some(true) {
+        anyhow::bail!("claude error: {}", envelope["result"]);
+    }
+
+    let result_text = envelope["result"].as_str().unwrap_or("");
+    let tasks: Vec<Task> = serde_json::from_str(result_text).map_err(|e| {
+        let raw_path = plan_dir(&plan_id).join("raw_response.txt");
+        let _ = fs::write(&raw_path, result_text);
+        anyhow::anyhow!(
+            "claude response was not a valid JSON task array: {e}\n\
+             raw response saved to {}\n\
+             tip: try rephrasing the goal or re-running `mozart plan new`",
+            raw_path.display()
+        )
+    })?;
+
+    fs::write(plan_dir(&plan_id).join("tasks.json"), serde_json::to_string_pretty(&tasks)?)?;
+
+    if let Some(cost) = envelope["total_cost_usd"].as_f64() {
+        eprintln!("· cost: ${cost:.4}");
+    }
+    eprintln!("· {} tasks written", tasks.len());
+    eprintln!();
+    // stdout only — this is what PLAN=$(...) captures
+    println!("{}", plan_id);
+    Ok(())
+}
+
+fn cmd_plan_ls() -> anyhow::Result<()> {
+    let dir = plans_dir();
+    if !dir.exists() {
+        println!("no plans — use: mozart plan new \"<goal>\"");
+        return Ok(());
+    }
+    let mut entries: Vec<_> = fs::read_dir(&dir)?
+        .filter_map(|e| e.ok())
+        .filter(|e| e.path().is_dir())
+        .collect();
+    entries.sort_by_key(|e| e.file_name());
+    if entries.is_empty() {
+        println!("no plans — use: mozart plan new \"<goal>\"");
+        return Ok(());
+    }
+    for entry in entries {
+        let plan_id = entry.file_name().to_string_lossy().into_owned();
+        let goal = fs::read_to_string(entry.path().join("goal.txt"))
+            .unwrap_or_default()
+            .trim()
+            .to_string();
+        let tasks_raw = fs::read_to_string(entry.path().join("tasks.json")).unwrap_or_default();
+        let task_count = serde_json::from_str::<Vec<Task>>(&tasks_raw)
+            .map(|v| v.len())
+            .unwrap_or(0);
+        let short_goal = if goal.len() > 60 {
+            format!("{}…", &goal[..60])
+        } else {
+            goal
+        };
+        println!("  {}…  {}  ({} tasks)", &plan_id[..8], short_goal, task_count);
+    }
+    Ok(())
+}
+
+fn cmd_plan_show(plan_id: &str) -> anyhow::Result<()> {
+    let dir = plan_dir(plan_id);
+    if !dir.exists() {
+        anyhow::bail!("plan {} not found — run `mozart plan ls`", plan_id);
+    }
+    let goal = fs::read_to_string(dir.join("goal.txt"))?.trim().to_string();
+    let tasks: Vec<Task> = serde_json::from_str(&fs::read_to_string(dir.join("tasks.json"))?)?;
+    let short_id = &plan_id[..8.min(plan_id.len())];
+    println!("Plan: {short_id}…");
+    println!("Goal: {goal}");
+    println!();
+    for (i, task) in tasks.iter().enumerate() {
+        println!("{}. {}", i + 1, task.title);
+        println!("   {}", task.description);
+        if !task.context.is_empty() {
+            println!("   context: {}", task.context);
+        }
+        println!();
+    }
+    Ok(())
+}
+
+fn cmd_plan_dispatch(plan_id: &str, task_num: usize, session_id: Option<&str>) -> anyhow::Result<()> {
+    let dir = plan_dir(plan_id);
+    if !dir.exists() {
+        anyhow::bail!("plan {} not found — run `mozart plan ls`", plan_id);
+    }
+    let tasks: Vec<Task> = serde_json::from_str(&fs::read_to_string(dir.join("tasks.json"))?)?;
+    if task_num == 0 || task_num > tasks.len() {
+        anyhow::bail!(
+            "task {} not found — plan has {} task{} (1-indexed)",
+            task_num,
+            tasks.len(),
+            if tasks.len() == 1 { "" } else { "s" }
+        );
+    }
+    let task = &tasks[task_num - 1];
+    let message = format!(
+        "Task: {}\n\n{}\n\nContext:\n{}",
+        task.title, task.description, task.context
+    );
+
+    let resolved_sid = match session_id {
+        Some(sid) => sid.to_string(),
+        None => {
+            eprintln!("· no session specified — creating a new one");
+            let sid = create_session(".")?;
+            let mut cfg = load_config();
+            cfg.active_session = Some(sid.clone());
+            save_config(&cfg)?;
+            sid
+        }
+    };
+
+    eprintln!(
+        "· dispatching task {} ({}) to session {}…",
+        task_num,
+        task.title,
+        &resolved_sid[..8.min(resolved_sid.len())]
+    );
+    cmd_send(&resolved_sid, &message, false)
+}
+
 fn cmd_guide() {
     println!("TYPICAL WORKFLOW");
     println!();
@@ -983,6 +1198,18 @@ fn cmd_guide() {
     println!("  repo use <n>         switch the active repo by number");
     println!("  session ls           list all sessions (* = active), with repo and status");
     println!("  session use <n>      set the active session by number");
+    println!("  plan new \"<goal>\"     call claude to decompose goal into tasks, print plan ID");
+    println!("  plan ls              list all plans");
+    println!("  plan show <id>       print numbered task list");
+    println!("  plan dispatch <id> <n>          send task N to a new session");
+    println!("  plan dispatch <id> <n> <sid>    send task N to an existing session");
+    println!();
+    println!("PLANNING WORKFLOW");
+    println!();
+    println!("  PLAN=$(mozart plan new \"refactor auth module into smaller helpers\")");
+    println!("  mozart plan show $PLAN");
+    println!("  mozart plan dispatch $PLAN 1   # creates session, sends task 1, sets active");
+    println!("  mozart wait                    # wait for result (uses active session)");
     println!();
     println!("STATE  (~/.mozart/cli/)");
     println!();
@@ -993,6 +1220,9 @@ fn cmd_guide() {
     println!("    run.err            claude stderr");
     println!("    run.exit           exit code");
     println!("    run.done           sentinel — appears when the run is complete");
+    println!("  plans/<plan-id>/     one directory per decomposed goal");
+    println!("    goal.txt           the original goal string");
+    println!("    tasks.json         JSON array of tasks from decomposition");
     println!();
     println!("TMUX");
     println!();
@@ -1070,6 +1300,13 @@ fn main() {
         Cmd::Session { action } => match action {
             SessionCmd::Ls        => cmd_session_ls(),
             SessionCmd::Use { n } => cmd_session_use(*n),
+        },
+        Cmd::Plan { action } => match action {
+            PlanCmd::New { goal }                                      => cmd_plan_new(goal),
+            PlanCmd::Ls                                                => cmd_plan_ls(),
+            PlanCmd::Show { plan_id }                                  => cmd_plan_show(plan_id),
+            PlanCmd::Dispatch { plan_id, task_num, session_id }        =>
+                cmd_plan_dispatch(plan_id, *task_num, session_id.as_deref()),
         },
     };
     if let Err(e) = result {

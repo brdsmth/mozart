@@ -24,9 +24,18 @@ Quality-of-life features on top of the core process model.
 - `run.done` busy guard on `send` — refuses to dispatch while the previous turn is still running
 - Wait digest: turns, wall-clock, cost, denied tool calls
 
+## Step 2.5 — Planning (done)
+
+Bridge toward concurrency: decompose a high-level goal into isolated tasks, each dispatchable to a separate agent session.
+
+- `mozart plan new "<goal>"` — one-shot claude call (direct subprocess, not tmux) decomposes the goal into a JSON task list stored at `~/.mozart/cli/plans/<plan-id>/`
+- `mozart plan ls/show` — inspect plans on disk
+- `mozart plan dispatch <id> <n>` — send a task to a session (creates one if omitted, sets it as active)
+- Teaches the contrast between one-shot blocking subprocess (planner) and persistent tmux sessions (agent workers)
+
 ## Step 3 — Concurrency
 
-Run several sessions/agents at once and observe and manage them together. The first taste of "many agents at once" instead of one at a time.
+Run several sessions/agents at once and observe and manage them together. The first taste of "many agents at once" instead of one at a time. Natural extension of planning: dispatch all tasks from a plan concurrently rather than one at a time.
 
 ## Step 4 — Pluggable backends
 
