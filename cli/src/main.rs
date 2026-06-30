@@ -905,6 +905,24 @@ fn fmt_elapsed(secs: u64) -> String {
     }
 }
 
+fn run_token_usage(run_id: &str) -> Option<(u64, u64)> {
+    let stdout = fs::read_to_string(run_dir(run_id).join("run.out")).ok()?;
+    let v: serde_json::Value = serde_json::from_str(&stdout).ok()?;
+    let input  = v["usage"]["input_tokens"].as_u64()?;
+    let output = v["usage"]["output_tokens"].as_u64()?;
+    Some((input, output))
+}
+
+fn fmt_tokens(n: u64) -> String {
+    if n >= 1_000_000 {
+        format!("{:.1}M", n as f64 / 1_000_000.0)
+    } else if n >= 1_000 {
+        format!("{:.1}k", n as f64 / 1_000.0)
+    } else {
+        format!("{n}")
+    }
+}
+
 fn cmd_status(full: bool, only_busy: bool, only_idle: bool) -> anyhow::Result<()> {
     let id_len = if full { usize::MAX } else { 8 };
     let short = |s: &str| -> String {
@@ -958,6 +976,8 @@ fn cmd_status(full: bool, only_busy: bool, only_idle: bool) -> anyhow::Result<()
     let mut rows: Vec<Row> = Vec::new();
     let mut n_busy = 0usize;
     let mut n_idle = 0usize;
+    let mut total_input: u64 = 0;
+    let mut total_output: u64 = 0;
 
     for id in &session_ids {
         let id_s = short(id);
@@ -978,6 +998,14 @@ fn cmd_status(full: bool, only_busy: bool, only_idle: bool) -> anyhow::Result<()
             });
         } else if let Some(run_id) = session_latest_run(id) {
             n_idle += 1;
+            // Accumulate tokens for the header total regardless of filter flags.
+            let tok_tag = if let Some((inp, out)) = run_token_usage(&run_id) {
+                total_input  += inp;
+                total_output += out;
+                format!("  {}↑ {}↓", fmt_tokens(inp), fmt_tokens(out))
+            } else {
+                String::new()
+            };
             if only_busy { continue; }
             let run_s = short(&run_id);
             let done_path = run_dir(&run_id).join("run.done");
@@ -991,7 +1019,7 @@ fn cmd_status(full: bool, only_busy: bool, only_idle: bool) -> anyhow::Result<()
             rows.push(Row {
                 group: 1,
                 sort_key: secs,
-                line: format!("  [idle]  {id_s}  last run {run_s}{ago}{tmux_tag}"),
+                line: format!("  [idle]  {id_s}  last run {run_s}{ago}{tok_tag}{tmux_tag}"),
             });
         } else {
             if only_busy || only_idle { continue; }
@@ -1010,6 +1038,9 @@ fn cmd_status(full: bool, only_busy: bool, only_idle: bool) -> anyhow::Result<()
     print!("{total} session{}", if total == 1 { "" } else { "s" });
     if n_busy > 0 || n_idle > 0 {
         print!("  ({n_busy} busy, {n_idle} idle)");
+    }
+    if total_input > 0 || total_output > 0 {
+        print!("  · {}↑ {}↓ tokens", fmt_tokens(total_input), fmt_tokens(total_output));
     }
     println!();
     println!();
