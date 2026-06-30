@@ -1154,6 +1154,7 @@ fn cmd_plan_new(goal: &str) -> anyhow::Result<()> {
 
     let mut full_text = String::new();
     let mut result_meta: Option<serde_json::Value> = None;
+    let mut connected = false;
 
     for line in reader.lines() {
         let line = line?;
@@ -1161,7 +1162,10 @@ fn cmd_plan_new(goal: &str) -> anyhow::Result<()> {
         if let Ok(event) = serde_json::from_str::<serde_json::Value>(&line) {
             match event["type"].as_str() {
                 Some("system") => {
-                    eprintln!("· connected, waiting for response...");
+                    if !connected {
+                        eprintln!("· connected, waiting for response...");
+                        connected = true;
+                    }
                 }
                 Some("assistant") => {
                     if let Some(content) = event["message"]["content"].as_array() {
