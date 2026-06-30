@@ -153,6 +153,11 @@ enum PlanCmd {
         /// Plan ID
         plan_id: String,
     },
+    /// Review results of all dispatched tasks (exit codes, errors, cost)
+    Review {
+        /// Plan ID
+        plan_id: String,
+    },
 }
 
 // ~/.mozart/cli/ is the root for all CLI-managed state.
@@ -183,8 +188,38 @@ struct Task {
     depends_on: Vec<usize>,
 }
 
+#[derive(Serialize, Deserialize, Debug, Clone)]
+struct DispatchRecord {
+    task_num: usize,
+    title: String,
+    session_id: String,
+}
+
 fn config_path() -> PathBuf {
     cli_home().join("config.json")
+}
+
+fn plan_sessions_path(plan_id: &str) -> PathBuf {
+    plan_dir(plan_id).join("sessions.json")
+}
+
+fn load_dispatch_records(plan_id: &str) -> Vec<DispatchRecord> {
+    fs::read_to_string(plan_sessions_path(plan_id))
+        .ok()
+        .and_then(|s| serde_json::from_str(&s).ok())
+        .unwrap_or_default()
+}
+
+fn save_dispatch_record(plan_id: &str, record: DispatchRecord) -> anyhow::Result<()> {
+    let mut records = load_dispatch_records(plan_id);
+    if let Some(existing) = records.iter_mut().find(|r| r.task_num == record.task_num) {
+        *existing = record;
+    } else {
+        records.push(record);
+    }
+    records.sort_by_key(|r| r.task_num);
+    fs::write(plan_sessions_path(plan_id), serde_json::to_string_pretty(&records)?)?;
+    Ok(())
 }
 
 fn plans_dir() -> PathBuf {
@@ -1228,7 +1263,13 @@ fn cmd_plan_dispatch(plan_id: &str, task_num: usize, session_id: Option<&str>) -
         task.title,
         &resolved_sid[..8.min(resolved_sid.len())]
     );
-    cmd_send(&resolved_sid, &message, false)
+    cmd_send(&resolved_sid, &message, true)?;
+    save_dispatch_record(plan_id, DispatchRecord {
+        task_num,
+        title: task.title.clone(),
+        session_id: resolved_sid,
+    })?;
+    Ok(())
 }
 
 fn build_task_message(task: &Task, task_num: usize, all_tasks: &[Task]) -> String {
@@ -1280,11 +1321,139 @@ fn cmd_plan_dispatch_all(plan_id: &str) -> anyhow::Result<()> {
             &session_id[..8],
             task.title
         );
-        cmd_send(&session_id, &message, false)?;
+        cmd_send(&session_id, &message, true)?;
+        save_dispatch_record(plan_id, DispatchRecord {
+            task_num,
+            title: task.title.clone(),
+            session_id,
+        })?;
     }
 
     eprintln!();
     eprintln!("· all tasks dispatched — monitor with: mozart status");
+    eprintln!("· review results when done: mozart plan review {plan_id}");
+    Ok(())
+}
+
+fn cmd_plan_review(plan_id: &str) -> anyhow::Result<()> {
+    let dir = plan_dir(plan_id);
+    if !dir.exists() {
+        anyhow::bail!("plan {} not found — run `mozart plan ls`", plan_id);
+    }
+    let goal = fs::read_to_string(dir.join("goal.txt"))?.trim().to_string();
+    let tasks: Vec<Task> = serde_json::from_str(&fs::read_to_string(dir.join("tasks.json"))?)?;
+    let records = load_dispatch_records(plan_id);
+
+    println!("Plan: {}…", &plan_id[..8.min(plan_id.len())]);
+    println!("Goal: {goal}");
+    println!();
+
+    let mut n_done = 0usize;
+    let mut n_busy = 0usize;
+    let mut n_error = 0usize;
+    let mut n_skipped = 0usize;
+    let mut error_details: Vec<(usize, String, String)> = Vec::new(); // (task_num, title, detail)
+
+    for (i, task) in tasks.iter().enumerate() {
+        let task_num = i + 1;
+        let record = records.iter().find(|r| r.task_num == task_num);
+
+        let Some(rec) = record else {
+            n_skipped += 1;
+            println!("  [ -    ]  {task_num}. {}", task.title);
+            continue;
+        };
+
+        let sid = &rec.session_id;
+        let short_sid = &sid[..8.min(sid.len())];
+
+        if let Some(_busy_run) = session_busy_run(sid) {
+            n_busy += 1;
+            println!("  [ busy ]  {task_num}. {}  (session {short_sid}…)", task.title);
+            continue;
+        }
+
+        let Some(run_id) = session_latest_run(sid) else {
+            n_skipped += 1;
+            println!("  [ -    ]  {task_num}. {}  (session {short_sid}… — no run)", task.title);
+            continue;
+        };
+
+        let rdir = run_dir(&run_id);
+        let exit_code: Option<i32> = fs::read_to_string(rdir.join("run.exit"))
+            .ok()
+            .and_then(|s| s.trim().parse().ok());
+
+        let stdout = fs::read_to_string(rdir.join("run.out")).unwrap_or_default();
+        let parsed: Option<serde_json::Value> = serde_json::from_str(&stdout).ok();
+        let is_error = parsed.as_ref()
+            .and_then(|v| v["is_error"].as_bool())
+            .unwrap_or(false);
+        let cost = parsed.as_ref()
+            .and_then(|v| v["total_cost_usd"].as_f64());
+
+        let cost_str = cost.map(|c| format!("  ${c:.4}")).unwrap_or_default();
+
+        if exit_code == Some(0) && !is_error {
+            n_done += 1;
+            println!("  [ done ]  {task_num}. {}  (session {short_sid}…){cost_str}", task.title);
+        } else {
+            n_error += 1;
+            let stderr = fs::read_to_string(rdir.join("run.err")).unwrap_or_default();
+            let result_snippet = parsed.as_ref()
+                .and_then(|v| v["result"].as_str())
+                .unwrap_or("")
+                .lines()
+                .take(3)
+                .collect::<Vec<_>>()
+                .join(" ");
+            let detail = if !stderr.trim().is_empty() {
+                stderr.lines().last().unwrap_or("").trim().to_string()
+            } else if !result_snippet.is_empty() {
+                result_snippet
+            } else {
+                format!("exit {}", exit_code.unwrap_or(-1))
+            };
+            println!(
+                "  [error ]  {task_num}. {}  (session {short_sid}…)  exit {}",
+                task.title,
+                exit_code.unwrap_or(-1)
+            );
+            error_details.push((task_num, task.title.clone(), detail));
+        }
+    }
+
+    println!();
+    print!("{n_done} done");
+    if n_busy   > 0 { print!("  {n_busy} busy"); }
+    if n_error  > 0 { print!("  {n_error} error"); }
+    if n_skipped > 0 { print!("  {n_skipped} not dispatched"); }
+    println!();
+
+    if !error_details.is_empty() {
+        println!();
+        println!("ERRORS");
+        for (num, title, detail) in &error_details {
+            println!();
+            println!("  task {num}: {title}");
+            println!("  {detail}");
+            // show last few lines of stderr for more context
+            let rec = records.iter().find(|r| r.task_num == *num);
+            if let Some(rec) = rec {
+                if let Some(run_id) = session_latest_run(&rec.session_id) {
+                    let stderr = fs::read_to_string(run_dir(&run_id).join("run.err"))
+                        .unwrap_or_default();
+                    let lines: Vec<&str> = stderr.lines()
+                        .filter(|l| !l.trim().is_empty())
+                        .collect();
+                    for line in lines.iter().rev().take(5).rev() {
+                        println!("    {line}");
+                    }
+                }
+            }
+        }
+    }
+
     Ok(())
 }
 
@@ -1340,6 +1509,7 @@ fn cmd_guide() {
     println!("  plan dispatch <id> <task-num>          send that task to a new session");
     println!("  plan dispatch <id> <task-num> <sid>   send that task to an existing session");
     println!("  plan dispatch-all <id>                 dispatch all tasks, one session each");
+    println!("  plan review <id>                       show status/errors for all dispatched tasks");
     println!();
     println!("PLANNING WORKFLOW");
     println!();
@@ -1450,6 +1620,8 @@ fn main() {
                 cmd_plan_dispatch(plan_id, *task_num, session_id.as_deref()),
             PlanCmd::DispatchAll { plan_id }                           =>
                 cmd_plan_dispatch_all(plan_id),
+            PlanCmd::Review { plan_id }                                =>
+                cmd_plan_review(plan_id),
         },
     };
     if let Err(e) = result {
