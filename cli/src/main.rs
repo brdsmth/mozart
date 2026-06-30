@@ -148,6 +148,11 @@ enum PlanCmd {
         /// Session ID to dispatch to. If omitted, a new session is created.
         session_id: Option<String>,
     },
+    /// Dispatch all tasks at once, each to its own new session
+    DispatchAll {
+        /// Plan ID
+        plan_id: String,
+    },
 }
 
 // ~/.mozart/cli/ is the root for all CLI-managed state.
@@ -174,6 +179,8 @@ struct Task {
     title: String,
     description: String,
     context: String,
+    #[serde(default)]
+    depends_on: Vec<usize>,
 }
 
 fn config_path() -> PathBuf {
@@ -1004,10 +1011,12 @@ fn cmd_plan_new(goal: &str) -> anyhow::Result<()> {
             to start immediately without asking clarifying questions.\n\
          3. Your ENTIRE response must be a JSON array. No markdown, no code fences, \
             no preamble, no trailing text of any kind.\n\
-         4. Each element has exactly three string fields:\n\
+         4. Each element has exactly these fields:\n\
             - \"title\": short task name (5-10 words)\n\
             - \"description\": what to do and how to verify it worked (2-4 sentences)\n\
-            - \"context\": background, constraints, or conventions the agent needs\n\n\
+            - \"context\": background, constraints, or conventions the agent needs\n\
+            - \"depends_on\": array of 1-indexed task numbers this task requires completed \
+              first (use [] if none)\n\n\
          Output only the raw JSON array, starting with [ and ending with ].",
         goal = goal
     );
@@ -1155,6 +1164,10 @@ fn cmd_plan_show(plan_id: &str) -> anyhow::Result<()> {
         if !task.context.is_empty() {
             println!("   context: {}", task.context);
         }
+        if !task.depends_on.is_empty() {
+            let deps: Vec<String> = task.depends_on.iter().map(|n| format!("task {n}")).collect();
+            println!("   depends on: {}", deps.join(", "));
+        }
         println!();
     }
     Ok(())
@@ -1175,10 +1188,7 @@ fn cmd_plan_dispatch(plan_id: &str, task_num: usize, session_id: Option<&str>) -
         );
     }
     let task = &tasks[task_num - 1];
-    let message = format!(
-        "Task: {}\n\n{}\n\nContext:\n{}",
-        task.title, task.description, task.context
-    );
+    let message = build_task_message(task, task_num, &tasks);
 
     let resolved_sid = match session_id {
         Some(sid) => sid.to_string(),
@@ -1199,6 +1209,53 @@ fn cmd_plan_dispatch(plan_id: &str, task_num: usize, session_id: Option<&str>) -
         &resolved_sid[..8.min(resolved_sid.len())]
     );
     cmd_send(&resolved_sid, &message, false)
+}
+
+fn build_task_message(task: &Task, task_num: usize, all_tasks: &[Task]) -> String {
+    let mut msg = format!(
+        "Task {task_num}: {}\n\n{}\n\nContext:\n{}",
+        task.title, task.description, task.context
+    );
+    if !task.depends_on.is_empty() {
+        msg.push_str("\n\nThis task depends on the following tasks being completed first:");
+        for dep in &task.depends_on {
+            if let Some(dep_task) = all_tasks.get(dep - 1) {
+                msg.push_str(&format!("\n  - Task {dep}: {}", dep_task.title));
+            }
+        }
+    }
+    msg
+}
+
+fn cmd_plan_dispatch_all(plan_id: &str) -> anyhow::Result<()> {
+    let dir = plan_dir(plan_id);
+    if !dir.exists() {
+        anyhow::bail!("plan {} not found — run `mozart plan ls`", plan_id);
+    }
+    let tasks: Vec<Task> = serde_json::from_str(&fs::read_to_string(dir.join("tasks.json"))?)?;
+    if tasks.is_empty() {
+        anyhow::bail!("plan has no tasks");
+    }
+
+    eprintln!("· dispatching {} tasks to {} sessions…", tasks.len(), tasks.len());
+    eprintln!();
+
+    let tasks_clone = tasks.clone();
+    for (i, task) in tasks_clone.iter().enumerate() {
+        let task_num = i + 1;
+        let session_id = create_session(".")?;
+        let message = build_task_message(task, task_num, &tasks);
+        eprintln!(
+            "  task {task_num}  {}…  {}",
+            &session_id[..8],
+            task.title
+        );
+        cmd_send(&session_id, &message, false)?;
+    }
+
+    eprintln!();
+    eprintln!("· all tasks dispatched — monitor with: mozart status");
+    Ok(())
 }
 
 fn cmd_guide() {
@@ -1252,13 +1309,17 @@ fn cmd_guide() {
     println!("  plan show <id>       print numbered task list");
     println!("  plan dispatch <id> <task-num>          send that task to a new session");
     println!("  plan dispatch <id> <task-num> <sid>   send that task to an existing session");
+    println!("  plan dispatch-all <id>                 dispatch all tasks, one session each");
     println!();
     println!("PLANNING WORKFLOW");
     println!();
     println!("  PLAN=$(mozart plan new \"refactor auth module into smaller helpers\")");
     println!("  mozart plan show $PLAN");
-    println!("  mozart plan dispatch $PLAN 1   # task-num 1 → new session, sets active");
-    println!("  mozart wait                    # wait for result (uses active session)");
+    println!("  mozart plan dispatch-all $PLAN         # all tasks → concurrent sessions");
+    println!("  mozart status                          # monitor all sessions");
+    println!("  # or dispatch a single task:");
+    println!("  mozart plan dispatch $PLAN 1           # task-num 1 → new session, sets active");
+    println!("  mozart wait                            # wait for result (uses active session)");
     println!();
     println!("STATE  (~/.mozart/cli/)");
     println!();
@@ -1356,6 +1417,8 @@ fn main() {
             PlanCmd::Show { plan_id }                                  => cmd_plan_show(plan_id),
             PlanCmd::Dispatch { plan_id, task_num, session_id }        =>
                 cmd_plan_dispatch(plan_id, *task_num, session_id.as_deref()),
+            PlanCmd::DispatchAll { plan_id }                           =>
+                cmd_plan_dispatch_all(plan_id),
         },
     };
     if let Err(e) = result {
