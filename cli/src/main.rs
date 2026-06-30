@@ -99,6 +99,11 @@ enum Cmd {
         #[command(subcommand)]
         action: PlanCmd,
     },
+    /// Execute a plan's tasks in dependency order, wave by wave
+    Queue {
+        #[command(subcommand)]
+        action: QueueCmd,
+    },
 }
 
 #[derive(Subcommand)]
@@ -160,6 +165,27 @@ enum PlanCmd {
     },
 }
 
+#[derive(Subcommand)]
+enum QueueCmd {
+    /// Create a queue from a plan's tasks (respects depends_on ordering)
+    New {
+        /// Plan ID to build the queue from
+        plan_id: String,
+    },
+    /// List all queues with goal and progress
+    Ls,
+    /// Show queue items and their current status
+    Show {
+        /// Queue ID (from `mozart queue ls`)
+        queue_id: String,
+    },
+    /// Dispatch tasks wave by wave in dependency order, blocking until all complete
+    Run {
+        /// Queue ID
+        queue_id: String,
+    },
+}
+
 // ~/.mozart/cli/ is the root for all CLI-managed state.
 // Sessions live at ~/.mozart/cli/sessions/<session-id> (presence = has had a turn)
 // Runs live at    ~/.mozart/cli/runs/<run-id>/{run.out, run.err, run.exit, run.done}
@@ -195,8 +221,50 @@ struct DispatchRecord {
     session_id: String,
 }
 
+#[derive(Serialize, Deserialize, Debug, Clone, PartialEq)]
+#[serde(rename_all = "lowercase")]
+enum QueueStatus { Pending, Running, Done, Failed }
+
+#[derive(Serialize, Deserialize, Debug, Clone)]
+struct QueueItem {
+    item_num: usize,
+    plan_id: String,
+    task_num: usize,
+    title: String,
+    #[serde(default)]
+    depends_on: Vec<usize>,
+    status: QueueStatus,
+    #[serde(default)]
+    session_id: Option<String>,
+}
+
+#[derive(Serialize, Deserialize, Debug, Clone)]
+struct QueueMeta {
+    plan_id: String,
+    goal: String,
+    repo: String,
+}
+
 fn config_path() -> PathBuf {
     cli_home().join("config.json")
+}
+
+fn queues_dir() -> PathBuf { cli_home().join("queues") }
+fn queue_dir(id: &str) -> PathBuf { queues_dir().join(id) }
+fn queue_items_path(id: &str) -> PathBuf { queue_dir(id).join("items.json") }
+fn queue_meta_path(id: &str) -> PathBuf { queue_dir(id).join("meta.json") }
+
+fn load_queue_items(id: &str) -> anyhow::Result<Vec<QueueItem>> {
+    Ok(serde_json::from_str(&fs::read_to_string(queue_items_path(id))?)?)
+}
+
+fn save_queue_items(id: &str, items: &[QueueItem]) -> anyhow::Result<()> {
+    fs::write(queue_items_path(id), serde_json::to_string_pretty(items)?)?;
+    Ok(())
+}
+
+fn load_queue_meta(id: &str) -> anyhow::Result<QueueMeta> {
+    Ok(serde_json::from_str(&fs::read_to_string(queue_meta_path(id))?)?)
 }
 
 fn plan_sessions_path(plan_id: &str) -> PathBuf {
@@ -1457,6 +1525,269 @@ fn cmd_plan_review(plan_id: &str) -> anyhow::Result<()> {
     Ok(())
 }
 
+fn cmd_queue_new(plan_id: &str) -> anyhow::Result<()> {
+    let dir = plan_dir(plan_id);
+    if !dir.exists() {
+        anyhow::bail!("plan {} not found — run `mozart plan ls`", plan_id);
+    }
+    let goal = fs::read_to_string(dir.join("goal.txt"))?.trim().to_string();
+    let repo = fs::read_to_string(dir.join("repo.txt"))
+        .unwrap_or_default().trim().to_string();
+    let tasks: Vec<Task> = serde_json::from_str(&fs::read_to_string(dir.join("tasks.json"))?)?;
+
+    let queue_id = Uuid::new_v4().to_string();
+    fs::create_dir_all(queue_dir(&queue_id))?;
+
+    let meta = QueueMeta { plan_id: plan_id.to_string(), goal: goal.clone(), repo };
+    fs::write(queue_meta_path(&queue_id), serde_json::to_string_pretty(&meta)?)?;
+
+    let items: Vec<QueueItem> = tasks.iter().enumerate().map(|(i, t)| QueueItem {
+        item_num: i + 1,
+        plan_id: plan_id.to_string(),
+        task_num: i + 1,
+        title: t.title.clone(),
+        depends_on: t.depends_on.clone(),
+        status: QueueStatus::Pending,
+        session_id: None,
+    }).collect();
+    save_queue_items(&queue_id, &items)?;
+
+    eprintln!("· queue created from plan {}…", &plan_id[..8.min(plan_id.len())]);
+    eprintln!("· goal: {goal}");
+    eprintln!("· {} items:", items.len());
+    for item in &items {
+        if item.depends_on.is_empty() {
+            eprintln!("  {}. {}", item.item_num, item.title);
+        } else {
+            let deps: Vec<String> = item.depends_on.iter().map(|n| n.to_string()).collect();
+            eprintln!("  {}. {}  → after: {}", item.item_num, item.title, deps.join(", "));
+        }
+    }
+    eprintln!();
+    println!("{}", queue_id);
+    Ok(())
+}
+
+fn cmd_queue_ls() -> anyhow::Result<()> {
+    let dir = queues_dir();
+    if !dir.exists() {
+        println!("no queues — use: mozart queue new <plan-id>");
+        return Ok(());
+    }
+    let mut entries: Vec<_> = fs::read_dir(&dir)?
+        .filter_map(|e| e.ok())
+        .filter(|e| e.path().is_dir())
+        .collect();
+    entries.sort_by_key(|e| e.file_name());
+    if entries.is_empty() {
+        println!("no queues — use: mozart queue new <plan-id>");
+        return Ok(());
+    }
+    for entry in entries {
+        let qid = entry.file_name().to_string_lossy().into_owned();
+        let meta = load_queue_meta(&qid).ok();
+        let goal = meta.as_ref().map(|m| m.goal.as_str()).unwrap_or("(unknown)");
+        let short_goal = if goal.len() > 50 { format!("{}…", &goal[..50]) } else { goal.to_string() };
+        let items = load_queue_items(&qid).unwrap_or_default();
+        let n_done = items.iter().filter(|i| i.status == QueueStatus::Done).count();
+        let n_failed = items.iter().filter(|i| i.status == QueueStatus::Failed).count();
+        let total = items.len();
+        let progress = if n_failed > 0 {
+            format!("{n_done} done, {n_failed} failed / {total}")
+        } else {
+            format!("{n_done}/{total} done")
+        };
+        println!("  {}…  {}  ({})", &qid[..8.min(qid.len())], short_goal, progress);
+    }
+    Ok(())
+}
+
+fn cmd_queue_show(queue_id: &str) -> anyhow::Result<()> {
+    if !queue_dir(queue_id).exists() {
+        anyhow::bail!("queue {} not found — run `mozart queue ls`", queue_id);
+    }
+    let meta = load_queue_meta(queue_id)?;
+    let items = load_queue_items(queue_id)?;
+
+    println!("Queue: {}…", &queue_id[..8.min(queue_id.len())]);
+    println!("Goal:  {}", meta.goal);
+    println!("Repo:  {}", meta.repo);
+    println!();
+
+    for item in &items {
+        let status_tag = match item.status {
+            QueueStatus::Pending => "[pending]",
+            QueueStatus::Running => "[running]",
+            QueueStatus::Done    => "[done   ]",
+            QueueStatus::Failed  => "[failed ]",
+        };
+        let deps_str = if item.depends_on.is_empty() {
+            String::new()
+        } else {
+            let deps: Vec<String> = item.depends_on.iter().map(|n| format!("{n}")).collect();
+            format!("  → after: {}", deps.join(", "))
+        };
+        let suffix = match &item.session_id {
+            Some(sid) if item.status == QueueStatus::Running => {
+                format!("  (session {}…)", &sid[..8.min(sid.len())])
+            }
+            Some(sid) if item.status == QueueStatus::Done || item.status == QueueStatus::Failed => {
+                // show cost or exit code
+                let cost_str = session_latest_run(sid)
+                    .and_then(|run_id| fs::read_to_string(run_dir(&run_id).join("run.out")).ok())
+                    .and_then(|s| serde_json::from_str::<serde_json::Value>(&s).ok())
+                    .and_then(|v| v["total_cost_usd"].as_f64())
+                    .map(|c| format!("  ${c:.4}"))
+                    .unwrap_or_default();
+                cost_str
+            }
+            _ => String::new(),
+        };
+        println!("  {status_tag}  {}. {}{}{}", item.item_num, item.title, deps_str, suffix);
+    }
+
+    println!();
+    let n_done    = items.iter().filter(|i| i.status == QueueStatus::Done).count();
+    let n_running = items.iter().filter(|i| i.status == QueueStatus::Running).count();
+    let n_pending = items.iter().filter(|i| i.status == QueueStatus::Pending).count();
+    let n_failed  = items.iter().filter(|i| i.status == QueueStatus::Failed).count();
+    print!("{}/{} done", n_done, items.len());
+    if n_running > 0 { print!("  {n_running} running"); }
+    if n_pending > 0 { print!("  {n_pending} pending"); }
+    if n_failed  > 0 { print!("  {n_failed} failed"); }
+    println!();
+    Ok(())
+}
+
+fn cmd_queue_run(queue_id: &str) -> anyhow::Result<()> {
+    use std::collections::HashSet;
+
+    if !queue_dir(queue_id).exists() {
+        anyhow::bail!("queue {} not found — run `mozart queue ls`", queue_id);
+    }
+    let meta = load_queue_meta(queue_id)?;
+    eprintln!("· queue: {}", meta.goal);
+    eprintln!("· repo:  {}", meta.repo);
+    eprintln!();
+
+    // Load all tasks from the plan once (for building messages)
+    let all_tasks: Vec<Task> = fs::read_to_string(plan_dir(&meta.plan_id).join("tasks.json"))
+        .ok()
+        .and_then(|s| serde_json::from_str(&s).ok())
+        .unwrap_or_default();
+
+    let mut wave = 0usize;
+
+    loop {
+        let mut items = load_queue_items(queue_id)?;
+
+        // Check running items for completion
+        let mut any_completed = false;
+        for item in items.iter_mut().filter(|i| i.status == QueueStatus::Running) {
+            let Some(sid) = &item.session_id else { continue };
+            if session_busy_run(sid).is_some() { continue }  // still running
+
+            // Finished — read exit code
+            let exit_code: i32 = session_latest_run(sid)
+                .and_then(|run_id| fs::read_to_string(run_dir(&run_id).join("run.exit")).ok())
+                .and_then(|s| s.trim().parse().ok())
+                .unwrap_or(-1);
+
+            let cost_str = session_latest_run(sid)
+                .and_then(|run_id| fs::read_to_string(run_dir(&run_id).join("run.out")).ok())
+                .and_then(|s| serde_json::from_str::<serde_json::Value>(&s).ok())
+                .and_then(|v| v["total_cost_usd"].as_f64())
+                .map(|c| format!("${c:.4}"))
+                .unwrap_or_else(|| format!("exit {exit_code}"));
+
+            if exit_code == 0 {
+                item.status = QueueStatus::Done;
+                eprintln!("  ✓  task {}: {}  ({})", item.item_num, item.title, cost_str);
+            } else {
+                item.status = QueueStatus::Failed;
+                eprintln!("  ✗  task {}: {}  ({})", item.item_num, item.title, cost_str);
+            }
+            any_completed = true;
+        }
+        if any_completed {
+            save_queue_items(queue_id, &items)?;
+        }
+
+        let n_pending = items.iter().filter(|i| i.status == QueueStatus::Pending).count();
+        let n_running = items.iter().filter(|i| i.status == QueueStatus::Running).count();
+        let n_done    = items.iter().filter(|i| i.status == QueueStatus::Done).count();
+        let n_failed  = items.iter().filter(|i| i.status == QueueStatus::Failed).count();
+
+        if n_pending == 0 && n_running == 0 {
+            break;
+        }
+
+        // Find items ready to dispatch: pending + all deps are Done
+        let done_nums: HashSet<usize> = items.iter()
+            .filter(|i| i.status == QueueStatus::Done)
+            .map(|i| i.item_num)
+            .collect();
+
+        let ready_nums: Vec<usize> = items.iter()
+            .filter(|i| i.status == QueueStatus::Pending
+                && i.depends_on.iter().all(|d| done_nums.contains(d)))
+            .map(|i| i.item_num)
+            .collect();
+
+        if ready_nums.is_empty() && n_running == 0 {
+            eprintln!();
+            eprintln!("· stuck: {n_pending} pending task{} blocked by failed dependencies",
+                if n_pending == 1 { "" } else { "s" });
+            break;
+        }
+
+        if !ready_nums.is_empty() {
+            wave += 1;
+            eprintln!("  wave {wave}: dispatching {} task{}",
+                ready_nums.len(), if ready_nums.len() == 1 { "" } else { "s" });
+
+            for &num in &ready_nums {
+                let item = items.iter_mut().find(|i| i.item_num == num).unwrap();
+                let task = all_tasks.get(item.task_num - 1);
+                let message = match task {
+                    Some(t) => build_task_message(t, item.item_num, &all_tasks),
+                    None    => format!("Task {}: {}", item.item_num, item.title),
+                };
+                let session_id = create_session(&meta.repo)?;
+                cmd_send(&session_id, &message, true)?;
+                eprintln!("  → {}…  task {}: {}", &session_id[..8], item.item_num, item.title);
+                item.status = QueueStatus::Running;
+                item.session_id = Some(session_id);
+            }
+            save_queue_items(queue_id, &items)?;
+        }
+
+        eprintln!("  [polling — {} running, {} pending, {} done, {} failed]",
+            n_running + ready_nums.len(), n_pending.saturating_sub(ready_nums.len()),
+            n_done, n_failed);
+        thread::sleep(Duration::from_secs(10));
+    }
+
+    // Final summary
+    let items = load_queue_items(queue_id)?;
+    let n_done   = items.iter().filter(|i| i.status == QueueStatus::Done).count();
+    let n_failed = items.iter().filter(|i| i.status == QueueStatus::Failed).count();
+    let total_cost: f64 = items.iter()
+        .filter_map(|i| i.session_id.as_deref())
+        .filter_map(|sid| session_latest_run(sid))
+        .filter_map(|run_id| fs::read_to_string(run_dir(&run_id).join("run.out")).ok())
+        .filter_map(|s| serde_json::from_str::<serde_json::Value>(&s).ok())
+        .filter_map(|v| v["total_cost_usd"].as_f64())
+        .sum();
+
+    eprintln!();
+    eprintln!("· {n_done}/{} done{}",
+        items.len(),
+        if n_failed > 0 { format!("  {n_failed} failed") } else { String::new() });
+    eprintln!("· total cost: ${total_cost:.4}");
+    Ok(())
+}
+
 fn cmd_guide() {
     println!("TYPICAL WORKFLOW");
     println!();
@@ -1509,17 +1840,28 @@ fn cmd_guide() {
     println!("  plan dispatch <id> <task-num>          send that task to a new session");
     println!("  plan dispatch <id> <task-num> <sid>   send that task to an existing session");
     println!("  plan dispatch-all <id>                 dispatch all tasks, one session each");
-    println!("  plan review <id>                       show status/errors for all dispatched tasks");
+    println!("STATE  (~/.mozart/cli/)");
     println!();
-    println!("PLANNING WORKFLOW");
+    println!("  sessions/<id>        presence means the session has had at least one turn");
+    println!("                       first turn uses --session-id, subsequent use --resume");
+    println!("  runs/<run-id>/       one directory per turn");
+    println!("    run.out            claude stdout (JSON)");
+    println!("    run.err            claude stderr");
+    println!("    run.exit           exit code");
+    println!("    run.done           sentinel — appears when the run is complete");
+    println!("  plan review <id>                       show status/errors for dispatched tasks");
+    println!("  queue new <plan-id>                    create queue from plan (respects deps)");
+    println!("  queue ls                               list queues with progress");
+    println!("  queue show <queue-id>                  show items and current status");
+    println!("  queue run <queue-id>                   dispatch wave by wave, blocking");
     println!();
-    println!("  PLAN=$(mozart plan new \"refactor auth module into smaller helpers\")");
-    println!("  mozart plan show $PLAN");
-    println!("  mozart plan dispatch-all $PLAN         # all tasks → concurrent sessions");
-    println!("  mozart status                          # monitor all sessions");
-    println!("  # or dispatch a single task:");
-    println!("  mozart plan dispatch $PLAN 1           # task-num 1 → new session, sets active");
-    println!("  mozart wait                            # wait for result (uses active session)");
+    println!("QUEUE WORKFLOW");
+    println!();
+    println!("  PLAN=$(mozart plan new \"refactor auth module\")");
+    println!("  QUEUE=$(mozart queue new $PLAN)        # create queue from plan");
+    println!("  mozart queue show $QUEUE               # preview items and dep order");
+    println!("  mozart queue run $QUEUE                # blocking: wave-by-wave dispatch");
+    println!("  mozart queue show $QUEUE               # review final status");
     println!();
     println!("STATE  (~/.mozart/cli/)");
     println!();
@@ -1534,6 +1876,9 @@ fn cmd_guide() {
     println!("    goal.txt           the original goal string");
     println!("    repo.txt           repo path snapshotted at plan-creation time");
     println!("    tasks.json         JSON array of tasks from decomposition");
+    println!("  queues/<queue-id>/   one directory per queue");
+    println!("    meta.json          goal, plan_id, repo");
+    println!("    items.json         task items with live status (pending/running/done/failed)");
     println!();
     println!("TMUX");
     println!();
@@ -1622,6 +1967,12 @@ fn main() {
                 cmd_plan_dispatch_all(plan_id),
             PlanCmd::Review { plan_id }                                =>
                 cmd_plan_review(plan_id),
+        },
+        Cmd::Queue { action } => match action {
+            QueueCmd::New  { plan_id }   => cmd_queue_new(plan_id),
+            QueueCmd::Ls                 => cmd_queue_ls(),
+            QueueCmd::Show { queue_id }  => cmd_queue_show(queue_id),
+            QueueCmd::Run  { queue_id }  => cmd_queue_run(queue_id),
         },
     };
     if let Err(e) = result {
