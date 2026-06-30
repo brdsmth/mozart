@@ -2,7 +2,8 @@ use clap::{Parser, Subcommand};
 use serde::{Deserialize, Serialize};
 use std::fs;
 use std::path::PathBuf;
-use std::process::Command;
+use std::io::{BufRead, BufReader};
+use std::process::{Command, Stdio};
 use std::thread;
 use std::time::{Duration, SystemTime};
 use uuid::Uuid;
@@ -1011,29 +1012,70 @@ fn cmd_plan_new(goal: &str) -> anyhow::Result<()> {
         goal = goal
     );
 
-    eprintln!("· calling claude to decompose goal...");
-    let output = Command::new("claude")
-        .args(["-p", "--output-format", "json", "--permission-mode", "plan", &prompt])
-        .output()
+    eprintln!("· calling claude...");
+
+    let mut child = Command::new("claude")
+        .args(["-p", "--output-format", "stream-json", "--verbose", "--permission-mode", "plan", &prompt])
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null())
+        .spawn()
         .map_err(|e| anyhow::anyhow!("failed to run claude: {e}"))?;
 
-    if !output.status.success() {
-        let stderr = String::from_utf8_lossy(&output.stderr);
-        anyhow::bail!("claude exited non-zero:\n{stderr}");
+    let stdout = child.stdout.take().expect("stdout was piped");
+    let reader = BufReader::new(stdout);
+
+    let mut full_text = String::new();
+    let mut result_meta: Option<serde_json::Value> = None;
+
+    for line in reader.lines() {
+        let line = line?;
+        if line.is_empty() { continue; }
+        if let Ok(event) = serde_json::from_str::<serde_json::Value>(&line) {
+            match event["type"].as_str() {
+                Some("system") => {
+                    eprintln!("· connected, waiting for response...");
+                }
+                Some("assistant") => {
+                    if let Some(content) = event["message"]["content"].as_array() {
+                        for block in content {
+                            if let Some(text) = block["text"].as_str() {
+                                full_text.push_str(text);
+                            }
+                        }
+                    }
+                }
+                Some("result") => {
+                    result_meta = Some(event);
+                }
+                _ => {}
+            }
+        }
     }
 
-    let stdout = String::from_utf8_lossy(&output.stdout);
-    let envelope: serde_json::Value = serde_json::from_str(&stdout)
-        .map_err(|e| anyhow::anyhow!("unexpected output from claude: {e}\nraw: {stdout}"))?;
-
-    if envelope["is_error"].as_bool() == Some(true) {
-        anyhow::bail!("claude error: {}", envelope["result"]);
+    let status = child.wait()?;
+    if !status.success() {
+        anyhow::bail!("claude exited non-zero");
     }
 
-    let result_text = envelope["result"].as_str().unwrap_or("");
-    let tasks: Vec<Task> = serde_json::from_str(result_text).map_err(|e| {
+    if let Some(meta) = &result_meta {
+        if meta["is_error"].as_bool() == Some(true) {
+            anyhow::bail!("claude error: {}", meta["result"]);
+        }
+    }
+
+    // Fall back to result field if assistant text was empty
+    let result_text = if !full_text.is_empty() {
+        full_text.clone()
+    } else {
+        result_meta.as_ref()
+            .and_then(|m| m["result"].as_str())
+            .unwrap_or("")
+            .to_string()
+    };
+
+    let tasks: Vec<Task> = serde_json::from_str(&result_text).map_err(|e| {
         let raw_path = plan_dir(&plan_id).join("raw_response.txt");
-        let _ = fs::write(&raw_path, result_text);
+        let _ = fs::write(&raw_path, &result_text);
         anyhow::anyhow!(
             "claude response was not a valid JSON task array: {e}\n\
              raw response saved to {}\n\
@@ -1044,10 +1086,17 @@ fn cmd_plan_new(goal: &str) -> anyhow::Result<()> {
 
     fs::write(plan_dir(&plan_id).join("tasks.json"), serde_json::to_string_pretty(&tasks)?)?;
 
-    if let Some(cost) = envelope["total_cost_usd"].as_f64() {
-        eprintln!("· cost: ${cost:.4}");
+    eprintln!();
+    eprintln!("· {} tasks:", tasks.len());
+    for (i, task) in tasks.iter().enumerate() {
+        eprintln!("  {}. {}", i + 1, task.title);
     }
-    eprintln!("· {} tasks written", tasks.len());
+    eprintln!();
+    if let Some(meta) = &result_meta {
+        if let Some(cost) = meta["total_cost_usd"].as_f64() {
+            eprintln!("· cost: ${cost:.4}");
+        }
+    }
     eprintln!();
     // stdout only — this is what PLAN=$(...) captures
     println!("{}", plan_id);
@@ -1084,7 +1133,7 @@ fn cmd_plan_ls() -> anyhow::Result<()> {
         } else {
             goal
         };
-        println!("  {}…  {}  ({} tasks)", &plan_id[..8], short_goal, task_count);
+        println!("  {}  {}  ({} tasks)", plan_id, short_goal, task_count);
     }
     Ok(())
 }
@@ -1201,14 +1250,14 @@ fn cmd_guide() {
     println!("  plan new \"<goal>\"     call claude to decompose goal into tasks, print plan ID");
     println!("  plan ls              list all plans");
     println!("  plan show <id>       print numbered task list");
-    println!("  plan dispatch <id> <n>          send task N to a new session");
-    println!("  plan dispatch <id> <n> <sid>    send task N to an existing session");
+    println!("  plan dispatch <id> <task-num>          send that task to a new session");
+    println!("  plan dispatch <id> <task-num> <sid>   send that task to an existing session");
     println!();
     println!("PLANNING WORKFLOW");
     println!();
     println!("  PLAN=$(mozart plan new \"refactor auth module into smaller helpers\")");
     println!("  mozart plan show $PLAN");
-    println!("  mozart plan dispatch $PLAN 1   # creates session, sends task 1, sets active");
+    println!("  mozart plan dispatch $PLAN 1   # task-num 1 → new session, sets active");
     println!("  mozart wait                    # wait for result (uses active session)");
     println!();
     println!("STATE  (~/.mozart/cli/)");
