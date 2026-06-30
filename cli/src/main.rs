@@ -995,10 +995,26 @@ fn cmd_session_use(n: usize) -> anyhow::Result<()> {
     Ok(())
 }
 
+fn plan_repo(plan_id: &str) -> Option<String> {
+    fs::read_to_string(plan_dir(plan_id).join("repo.txt"))
+        .ok()
+        .map(|s| s.trim().to_string())
+        .filter(|s| !s.is_empty())
+}
+
 fn cmd_plan_new(goal: &str) -> anyhow::Result<()> {
     let plan_id = Uuid::new_v4().to_string();
     fs::create_dir_all(plan_dir(&plan_id))?;
     fs::write(plan_dir(&plan_id).join("goal.txt"), goal)?;
+
+    // Snapshot the active repo at plan-creation time so dispatch always uses
+    // the right working directory regardless of what's active later.
+    let cfg = load_config();
+    let repo_path = active_repo(&cfg)
+        .map(|s| s.to_string())
+        .unwrap_or_else(|| std::env::current_dir().unwrap_or_default().to_string_lossy().into_owned());
+    fs::write(plan_dir(&plan_id).join("repo.txt"), &repo_path)?;
+    eprintln!("· repo: {repo_path}");
 
     let prompt = format!(
         "Decompose the following goal into small, isolated coding tasks.\n\
@@ -1157,6 +1173,9 @@ fn cmd_plan_show(plan_id: &str) -> anyhow::Result<()> {
     let short_id = &plan_id[..8.min(plan_id.len())];
     println!("Plan: {short_id}…");
     println!("Goal: {goal}");
+    if let Some(repo) = plan_repo(plan_id) {
+        println!("Repo: {repo}");
+    }
     println!();
     for (i, task) in tasks.iter().enumerate() {
         println!("{}. {}", i + 1, task.title);
@@ -1194,7 +1213,8 @@ fn cmd_plan_dispatch(plan_id: &str, task_num: usize, session_id: Option<&str>) -
         Some(sid) => sid.to_string(),
         None => {
             eprintln!("· no session specified — creating a new one");
-            let sid = create_session(".")?;
+            let repo = plan_repo(plan_id).unwrap_or_else(|| ".".to_string());
+            let sid = create_session(&repo)?;
             let mut cfg = load_config();
             cfg.active_session = Some(sid.clone());
             save_config(&cfg)?;
@@ -1237,13 +1257,15 @@ fn cmd_plan_dispatch_all(plan_id: &str) -> anyhow::Result<()> {
         anyhow::bail!("plan has no tasks");
     }
 
+    let repo = plan_repo(plan_id).unwrap_or_else(|| ".".to_string());
+    eprintln!("· repo: {repo}");
     eprintln!("· dispatching {} tasks to {} sessions…", tasks.len(), tasks.len());
     eprintln!();
 
     let tasks_clone = tasks.clone();
     for (i, task) in tasks_clone.iter().enumerate() {
         let task_num = i + 1;
-        let session_id = create_session(".")?;
+        let session_id = create_session(&repo)?;
         let message = build_task_message(task, task_num, &tasks);
         eprintln!(
             "  task {task_num}  {}…  {}",
@@ -1332,6 +1354,7 @@ fn cmd_guide() {
     println!("    run.done           sentinel — appears when the run is complete");
     println!("  plans/<plan-id>/     one directory per decomposed goal");
     println!("    goal.txt           the original goal string");
+    println!("    repo.txt           repo path snapshotted at plan-creation time");
     println!("    tasks.json         JSON array of tasks from decomposition");
     println!();
     println!("TMUX");
