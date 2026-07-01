@@ -1237,7 +1237,14 @@ fn cmd_plan_new(goal: &str) -> anyhow::Result<()> {
             .to_string()
     };
 
-    let tasks: Vec<Task> = serde_json::from_str(&result_text).map_err(|e| {
+    // Claude sometimes wraps the JSON array in narration despite instructions
+    // not to. Extract the outermost [...] span before parsing.
+    let json_slice = match (result_text.find('['), result_text.rfind(']')) {
+        (Some(start), Some(end)) if start < end => &result_text[start..=end],
+        _ => result_text.as_str(),
+    };
+
+    let tasks: Vec<Task> = serde_json::from_str(json_slice).map_err(|e| {
         let raw_path = plan_dir(&plan_id).join("raw_response.txt");
         let _ = fs::write(&raw_path, &result_text);
         anyhow::anyhow!(
