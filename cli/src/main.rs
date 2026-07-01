@@ -1175,6 +1175,7 @@ fn cmd_plan_new(goal: &str) -> anyhow::Result<()> {
 
     let mut child = Command::new("claude")
         .args(["-p", "--output-format", "stream-json", "--verbose", "--permission-mode", "plan", &prompt])
+        .current_dir(&repo_path)
         .stdout(Stdio::piped())
         .stderr(Stdio::null())
         .spawn()
